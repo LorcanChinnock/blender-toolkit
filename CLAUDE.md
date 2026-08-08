@@ -232,6 +232,28 @@ old ones are what bpy has registered.
   slider drag both fire one per mouse-move event. Set a flag and let the timer
   coalesce them — and give the commit path an explicit flush, or renaming a
   group and hitting Add inside one poll commits a group never written.
+- **Arc position along a path must come from how the polyline was built, not
+  from `path_factor`.** That searches for the nearest point on the *whole* path,
+  so a path folding back reports an earlier stretch's position for a later
+  handle — exactly wrong, and invisible on a path that does not fold.
+  `handle_arc_positions` indexes the samples instead: stride 1 straight,
+  `samples_per_gap` curved.
+- **Nearest-point-on-a-path parameterisation is discontinuous, and smoothing
+  cannot hide it.** On the concave side of a bend a point is equidistant from
+  two stretches whose arc positions are far apart, so the weight jumps across
+  that tie line - measured at 0.44 across a bracket of 2.2e-16, i.e. a real
+  jump, not a steep gradient. `smooth()` diffuses it as 1/sqrt(passes): the
+  maximum 20 passes took 0.50 down to only 0.07. Curved does not help either
+  (0.52 -> 0.46, and worse on gentle bends). The fix is to let near-tied
+  segments share the answer, with the share falling to zero at `BLEND_FRACTION`
+  of the path length - continuous by construction, costs one extra projection
+  pass, and streams so it never holds a segments-by-vertices array.
+- **Invert must negate the weight, not mirror the position.** `profile(1 - t)`
+  and `1 - profile(t)` agree only for symmetric profiles; Root and Sphere are
+  not, so mirroring left a gradient and its inverse summing to something other
+  than 1. Negating also means the stored handle weight and what the bar shows
+  differ by a flip whenever Invert is on - see `flip()`, and note that negating
+  reverses the stops' order along the bar.
 - **Weight paint's ramp is a hue sweep, so it is one number.** Blue to red at
   full saturation passes through cyan, green and yellow — exactly Blender's
   weight colours — which makes `weight_colour`/`weight_of` an exact inverse pair

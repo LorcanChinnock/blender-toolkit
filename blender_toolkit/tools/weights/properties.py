@@ -68,9 +68,10 @@ def normalise_ramp(settings):
       not a straight line in RGB - interpolating blue to red the ordinary way
       goes through purple. In HSV/CCW the same two stops pass through cyan, green
       and yellow, matching weight paint exactly, so the widget *is* the legend.
-    - **Fully saturated, opaque.** A stop is snapped to the weight colour nearest
-      what it was given, so every colour in the ramp stands for a weight and
-      nothing can be picked that does not.
+    - **Colour follows position.** A stop's position *is* its handle's weight, so
+      its colour is simply the scale's colour there. That is what makes the
+      picker inert: Blender's widget still opens one, but whatever is chosen is
+      overwritten on the next poll.
     """
     ramp = ramp_of(settings)
     if ramp is None:
@@ -91,22 +92,34 @@ def normalise_ramp(settings):
         changed = True
 
     for element in ramp.elements:
-        snapped = gradient.weight_colour(gradient.weight_of(element.color))
-        if max(abs(a - b) for a, b in zip(element.color, snapped)) > 1e-6:
-            element.color = snapped
+        scale = gradient.weight_colour(element.position)
+        if max(abs(a - b) for a, b in zip(element.color, scale)) > 1e-6:
+            element.color = scale
             changed = True
     return changed
 
 
-def ramp_curve(settings):
-    """Value mapping from the ramp, or None to fall back to the named profile."""
-    ramp = ramp_of(settings) if settings.use_ramp else None
-    if ramp is None:
+def handle_arcs(settings, points=None):
+    """Where each handle sits along the path, 0..1."""
+    return gradient.handle_arc_positions(
+        points if points is not None else path_of(settings),
+        len(settings.handles),
+        settings.curved,
+    )
+
+
+def ramp_curve(settings, points=None):
+    """Value mapping from the handles, or None to fall back to the profile.
+
+    Not read off the ramp any more. A stop's position is its handle's weight, so
+    the curve is a knot per handle: where it sits along the path, and what it
+    weighs. The ramp is where the weight is *edited*, not where it is stored.
+    """
+    if not settings.use_ramp or len(settings.handles) < MIN_STOPS:
         return None
-    # The ramp is a hue sweep, so the weight is read back out of the hue. Between
-    # two stops HSV interpolates the hue linearly, which makes the weight blend
-    # linearly too - what an RGB ramp through purple could not do.
-    return lambda t: gradient.weight_of(ramp.evaluate(t))
+    return gradient.weight_curve(
+        zip(handle_arcs(settings, points), (h.weight for h in settings.handles))
+    )
 
 
 def reset_ramp(settings):
@@ -120,26 +133,11 @@ def reset_ramp(settings):
     # the others, so a cached list of them goes stale mid-loop.
     while len(ramp.elements) > MIN_STOPS:
         ramp.elements.remove(ramp.elements[1])
+    # Position is the weight now, so the ends of the bar are weights 0 and 1.
     ramp.elements[0].position = 0.0
     ramp.elements[0].color = gradient.weight_colour(0.0)
     ramp.elements[-1].position = 1.0
     ramp.elements[-1].color = gradient.weight_colour(1.0)
-
-
-def point_at(settings, t):
-    """The object-space point `t` of the way along the current path."""
-    points = path_of(settings)
-    lengths, offsets, total = gradient.segment_lengths(points)
-    if not total:
-        return Vector(points[0])
-
-    target = t * total
-    for index, length in enumerate(lengths):
-        if offsets[index] + length >= target or index == len(lengths) - 1:
-            local = (target - offsets[index]) / length if length else 0.0
-            a, b = Vector(points[index]), Vector(points[index + 1])
-            return a + (b - a) * min(max(local, 0.0), 1.0)
-    return Vector(points[-1])
 
 
 def ramp_signature(settings):
@@ -152,26 +150,65 @@ def ramp_signature(settings):
     ramp = ramp_of(settings)
     if ramp is None:
         return ()
-    return tuple((e.position, *e.color[:3]) for e in ramp.elements)
+    return tuple(sorted(e.position for e in ramp.elements))
+
+
+def flip(settings, weight):
+    """A weight as it reads on the bar, or back again. Its own inverse.
+
+    A handle stores the weight the *un-inverted* gradient reaches there, and
+    Invert negates the result rather than mirroring the path. So what the bar
+    shows, what the mesh gets and what the handle is coloured are all the flip
+    of what is stored, and flipping twice is the identity.
+    """
+    return 1.0 - weight if settings.invert else weight
+
+
+def stops_in_handle_order(settings, stops):
+    """Sorted stop positions lined up with the handles they belong to.
+
+    Inverting negates every weight, which reverses their order along the bar -
+    so the first handle then owns the *last* stop.
+    """
+    return list(reversed(stops)) if settings.invert else list(stops)
+
+
+def mirror_weights_to_ramp(settings):
+    """Move the stops to where the handles' weights now read on the bar.
+
+    Nothing else writes stop positions - the bar is an input, not an output -
+    except when what a weight *means* changes underneath it, which is exactly
+    what Invert does.
+    """
+    ramp = ramp_of(settings)
+    if ramp is None or not settings.handles:
+        return
+    shown = sorted(flip(settings, h.weight) for h in settings.handles)
+    elements = sorted(ramp.elements, key=lambda e: e.position)
+    for element, weight in zip(elements, shown):
+        element.position = weight
+        element.color = gradient.weight_colour(weight)
 
 
 def handle_values(settings):
     """The weight the gradient produces at each handle.
 
-    A handle sits at its stop's position along the path, so this is exactly what
-    the mesh reads there - which is what lets a handle be drawn in the colour the
-    surface under it will be.
+    With the gradient on, that is the handle's own weight as the bar shows it -
+    the stop it owns sits at exactly that place on the scale. With it off, the
+    named profile decides, read at where the handle sits along the path. Either
+    way this is what the mesh reads there, which is what lets a handle be drawn
+    in the colour the surface under it will be.
     """
-    curve = ramp_curve(settings)
+    if settings.use_ramp:
+        return [flip(settings, h.weight) for h in settings.handles]
     return [
         gradient.value(
-            handle.t,
+            arc,
             profile=settings.profile,
             midpoint=settings.midpoint,
             invert=settings.invert,
-            curve=curve,
         )
-        for handle in settings.handles
+        for arc in handle_arcs(settings)
     ]
 
 
@@ -180,49 +217,68 @@ def handle_colours(settings):
     return [gradient.weight_colour(v) for v in handle_values(settings)]
 
 
+def _seed_between(handles, index):
+    """Where a handle inserted at `index` should start, in object space.
+
+    Midway between the neighbours it lands between, because the reason to add
+    one is almost always to bend the path where it currently runs straight. A
+    stop's position is a weight now, so there is no place along the path in it
+    to seed from.
+    """
+    if not handles:
+        return Vector((0.0, 0.0, 0.0))
+    before = Vector(handles[min(max(index - 1, 0), len(handles) - 1)][1])
+    after = Vector(handles[min(index, len(handles) - 1)][1])
+    if before == after:  # past an end: carry on the way the path was going
+        other = Vector(handles[max(len(handles) - 2, 0)][1])
+        return after + (after - other) * 0.5
+    return (before + after) * 0.5
+
+
 def sync_handles_to_ramp(settings):
-    """One handle per ramp stop, kept in stop order. True when handles changed.
+    """One handle per ramp stop. True when the handles changed.
 
     The gradient is the single control for how many control points there are:
-    its `+` and `-` are how you add a stop, and a handle appears at that spot
-    along the path. One widget, not two - a separate handle list is a second
-    place to manage the same thing.
+    its `+` and `-` are how you add a stop, and a handle appears with it. One
+    widget, not two - a separate handle list is a second place to manage the
+    same thing.
 
-    **Only the count is followed.** Dragging a stop sideways moves where its
-    value lands along the path; it does not drag the handle it was seeded from.
-    The ramp is the value profile, the handles are the shape of the path.
+    **A stop's position is its handle's weight.** Dragging it along the bar reads
+    a weight off the scale; it moves nothing in the viewport. Where the handle
+    falls along the path is the handle's own business, dragged there in 3D.
 
-    Each handle remembers the stop it belongs to, so inserting a stop in the
-    middle inserts a handle in the middle and leaves the dragged positions of
-    its neighbours alone.
+    Stops are kept in order by the widget and handles are matched to them in path
+    order, so weights run monotonically along the path - dragging one stop past
+    another swaps which handle owns which weight.
     """
     ramp = ramp_of(settings)
     if ramp is None or len(settings.handles) == 0:
         return False
 
-    stops = sorted(e.position for e in ramp.elements)
+    stops = stops_in_handle_order(settings, sorted(e.position for e in ramp.elements))
     if len(stops) == len(settings.handles):
-        # `t` trails its stop rather than steering the handle, so that a later
-        # add or remove can still tell which handle belongs to which stop.
+        # Where the user's drag landed. Nothing else writes these.
         for handle, stop in zip(settings.handles, stops):
-            handle.t = stop
+            handle.weight = flip(settings, stop)
         return False
 
-    # Seed against the path as it is now, before the collection is rebuilt.
-    existing = [(h.t, tuple(h.position)) for h in settings.handles]
+    # Matched in what the bar shows, so the comparison is like for like.
+    existing = [
+        (flip(settings, h.weight), tuple(h.position)) for h in settings.handles
+    ]
     taken = set()
     rebuilt = []
     for stop in stops:
         match = next(
             (
                 index
-                for index, (t, _position) in enumerate(existing)
-                if index not in taken and abs(t - stop) < 1e-6
+                for index, (weight, _position) in enumerate(existing)
+                if index not in taken and abs(weight - stop) < 1e-6
             ),
             None,
         )
         if match is None:
-            rebuilt.append((stop, tuple(point_at(settings, stop))))
+            rebuilt.append((stop, tuple(_seed_between(existing, len(rebuilt)))))
         else:
             taken.add(match)
             rebuilt.append((stop, existing[match][1]))
@@ -230,7 +286,7 @@ def sync_handles_to_ramp(settings):
     settings.handles.clear()
     for stop, position in rebuilt:
         handle = settings.handles.add()
-        handle.t = stop
+        handle.weight = flip(settings, stop)
         handle.position = position
     settings.active_handle = min(settings.active_handle, len(settings.handles) - 1)
     return True
@@ -323,7 +379,7 @@ def write_weights(context, settings, points=None, curve=None):
     mesh = obj.data
     if points is None:
         points = path_of(settings)
-        curve = ramp_curve(settings)
+        curve = ramp_curve(settings, points)
     if len(points) < 2:
         return
 
@@ -434,12 +490,9 @@ def save_record(obj, settings, name):
     }
     records[name] = {
         **{key: getattr(settings, key) for key in RECORDED},
-        "handles": [[h.t, *h.position] for h in settings.handles],
-        # Stored as weights, not colours: the record outlives whatever scale
-        # the widget happens to be showing them on.
-        "stops": [
-            [e.position, gradient.weight_of(e.color)] for e in ramp.elements
-        ] if ramp else [],
+        # Weight first, then the object-space position. The stops are not stored
+        # separately any more - a stop is just a handle's weight.
+        "handles": [[h.weight, *h.position] for h in settings.handles],
     }
     obj[RECORD_KEY] = records
 
@@ -459,35 +512,39 @@ def load_record(obj, settings, name):
         for key in RECORDED:
             setattr(settings, key, record[key])
 
-        settings.handles.clear()
-        for entry in record["handles"]:
-            handle = settings.handles.add()
-            # Three floats is a record from the short-lived version where
-            # handles had no stop of their own; spread those evenly instead.
-            if len(entry) == 4:
-                handle.t, handle.position = entry[0], entry[1:]
-            else:
-                handle.position = entry
-        settings.active_handle = 0
-        if settings.handles and not any(h.t for h in settings.handles):
-            last = max(len(settings.handles) - 1, 1)
-            for index, handle in enumerate(settings.handles):
-                handle.t = index / last
+        # Three shapes have been written. A leading float is a weight now, but
+        # in the version before this it was the stop position along the path,
+        # and the weights lived in a separate "stops" list.
+        entries = [list(e) for e in record["handles"]]
+        stops = [list(s) for s in record.get("stops", [])]
+        if len(entries[0]) == 4 and stops:
+            weights = [value for _position, value in stops]
+        elif len(entries[0]) == 4:
+            weights = [entry[0] for entry in entries]
+        else:  # no weight was stored at all; spread them evenly
+            last = max(len(entries) - 1, 1)
+            weights = [index / last for index in range(len(entries))]
 
-        stops = [list(s) for s in record["stops"]]
-        if stops:
-            ensure_ramp(settings)
-            ramp = ramp_of(settings)
-            # One at a time, re-fetched: removing invalidates the others.
-            while len(ramp.elements) > MIN_STOPS:
-                ramp.elements.remove(ramp.elements[1])
-            for index, (position, value) in enumerate(stops):
-                element = (
-                    ramp.elements[index] if index < len(ramp.elements)
-                    else ramp.elements.new(position)
-                )
-                element.position = position
-                element.color = gradient.weight_colour(value)
+        settings.handles.clear()
+        for entry, weight in zip(entries, weights):
+            handle = settings.handles.add()
+            handle.weight = weight
+            handle.position = entry[-3:]
+        settings.active_handle = 0
+
+        ensure_ramp(settings)
+        ramp = ramp_of(settings)
+        # One at a time, re-fetched: removing invalidates the others.
+        while len(ramp.elements) > MIN_STOPS:
+            ramp.elements.remove(ramp.elements[1])
+        shown = sorted(flip(settings, weight) for weight in weights)
+        for index, weight in enumerate(shown):
+            element = (
+                ramp.elements[index] if index < len(ramp.elements)
+                else ramp.elements.new(weight)
+            )
+            element.position = weight
+            element.color = gradient.weight_colour(weight)
     finally:
         settings.active = was_active
     return True
@@ -578,6 +635,12 @@ def _rewrite(self, context):
         mark_dirty()
 
 
+def _invert_changed(self, context):
+    """Negating the weights moves where each one reads on the bar."""
+    mirror_weights_to_ramp(self)
+    _rewrite(self, context)
+
+
 def _rename_group(self, context):
     """A rename moves the gradient rather than leaving a copy behind.
 
@@ -601,9 +664,9 @@ class TK_PG_gradient_handle(bpy.types.PropertyGroup):
     position: bpy.props.FloatVectorProperty(
         name="Position", subtype='TRANSLATION', unit='LENGTH', update=_mark_dirty
     )
-    # The ramp stop this handle belongs to, so a stop inserted in the middle
-    # grows a handle in the middle rather than one on the end.
-    t: bpy.props.FloatProperty(default=0.0, min=0.0, max=1.0)
+    # The weight the gradient reaches at this handle, and the position of the
+    # stop that edits it. The handle owns this; the ramp mirrors it.
+    weight: bpy.props.FloatProperty(default=0.0, min=0.0, max=1.0)
 
 
 
@@ -648,7 +711,13 @@ class TK_PG_weight_gradient(bpy.types.PropertyGroup):
         subtype='FACTOR',
         update=_rewrite,
     )
-    invert: bpy.props.BoolProperty(name="Invert", default=False, update=_rewrite)
+    invert: bpy.props.BoolProperty(
+        name="Invert",
+        description="Negate every weight, so a gradient and its inverse add up "
+        "to 1 everywhere. The stops move to where their weights now read",
+        default=False,
+        update=_invert_changed,
+    )
     smooth_repeat: bpy.props.IntProperty(
         name="Smooth",
         description="Relaxation passes over the weights",

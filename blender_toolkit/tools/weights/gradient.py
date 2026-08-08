@@ -4,6 +4,7 @@ No bpy import: this is the part worth testing directly rather than through an
 operator. Coordinates are object space; callers transform if they need world.
 """
 
+import bisect
 import colorsys
 import math
 
@@ -109,22 +110,28 @@ def _length(a):
 TARGET_SAMPLES = 120
 
 
+def samples_per_gap(handle_count):
+    """How finely a curved path is sampled between two handles.
+
+    A budget split across the gaps, so the cost of a curved path stops growing
+    with the square of the handle count. Up to eleven handles it works out at
+    the flat 12 it used to be.
+    """
+    return max(3, min(12, TARGET_SAMPLES // max(handle_count - 1, 1)))
+
+
 def path_points(handles, curved=False, per_segment=None):
     """The polyline the gradient runs along.
 
     Straight is the handles themselves. Curved is a Catmull-Rom sampling, chosen
     because it passes *through* its control points - a handle has to end up
     where you put it.
-
-    `per_segment` defaults to a budget split across the gaps, so the cost of a
-    curved path stops growing with the square of the handle count. Up to eleven
-    handles that works out at the flat 12 it used to be.
     """
     points = [tuple(h) for h in handles]
     if not curved or len(points) < 3:
         return points
     if per_segment is None:
-        per_segment = max(3, min(12, TARGET_SAMPLES // (len(points) - 1)))
+        per_segment = samples_per_gap(len(points))
 
     # Duplicate the ends so the first and last segments are drawn too.
     padded = [points[0]] + points + [points[-1]]
@@ -162,6 +169,67 @@ def segment_lengths(points):
     return lengths, offsets, running
 
 
+def handle_arc_positions(points, count, curved=False, per_segment=None):
+    """Where each handle sits along the path, 0..1.
+
+    Taken from how the polyline was built, never by searching for the handle in
+    it. `path_factor` looks like the obvious tool and is wrong here: it returns
+    the nearest point on the *whole* path, so on a path that folds back a handle
+    sitting near an earlier stretch reports that stretch's arc position instead
+    of its own, and its weight lands in the wrong place.
+
+    Straight, handle `i` is polyline vertex `i`. Curved, `path_points` emits
+    `per_segment` samples per gap beginning at the handle itself, so handle `i`
+    is sample `i * per_segment` and the last is the appended final sample.
+    """
+    if count < 2:
+        return [0.0] * count
+
+    _lengths, offsets, total = segment_lengths(points)
+    if not total:  # every handle in one place, mid-drag; spread them rather
+        return [i / (count - 1) for i in range(count)]  # than divide by zero
+
+    # offsets holds the arc length at every point but the last, which is `total`.
+    arcs = offsets + [total]
+    stride = 1
+    if curved and count > 2:
+        stride = per_segment if per_segment else samples_per_gap(count)
+    return [
+        _clamp(arcs[min(i * stride, len(arcs) - 1)] / total) for i in range(count)
+    ]
+
+
+def weight_curve(knots):
+    """Piecewise-linear mapping through `(position, weight)` pairs, or None.
+
+    What the ramp's stops mean once their position is the weight rather than a
+    place along the path: the pairs come from the handles, one knot each.
+    Outside the first and last knot the curve holds flat - a handle is a control
+    point, not a boundary, and the path runs past both ends of it.
+    """
+    knots = sorted(knots)
+    if not knots:
+        return None
+    positions = [k[0] for k in knots]
+    weights = [_clamp(k[1]) for k in knots]
+    if len(knots) == 1:
+        return lambda t: weights[0]
+
+    def curve(t):
+        if t <= positions[0]:
+            return weights[0]
+        if t >= positions[-1]:
+            return weights[-1]
+        index = bisect.bisect_right(positions, t) - 1
+        span = positions[index + 1] - positions[index]
+        if span <= 0.0:  # two handles at the same place along the path
+            return weights[index + 1]
+        local = (t - positions[index]) / span
+        return weights[index] + (weights[index + 1] - weights[index]) * local
+
+    return curve
+
+
 def _project(co, a, b):
     """Clamped projection of co onto segment a-b: (parameter, squared distance)."""
     direction = _sub(b, a)
@@ -179,12 +247,32 @@ def distance_to_segment(co, a, b):
     return math.sqrt(_project(co, a, b)[1])
 
 
-def path_factor(co, points, metrics=None):
-    """Arc-length position of co's nearest point on the polyline, 0..1.
+# How close a second segment has to be, as a fraction of the path's length,
+# before it starts sharing in the answer. Not exposed: measured across 2%, 5%,
+# 10% and 20% and the banding is gone at all of them, so it is not a dial worth
+# giving anyone.
+BLEND_FRACTION = 0.05
 
-    The scalar reference for `raw_factors`, and what the one-shot operator uses
-    for its two points. `metrics` is segment_lengths(points), hoisted out by
-    callers running this over more than one coordinate.
+
+def path_factor(co, points, metrics=None):
+    """Arc-length position of co along the polyline, 0..1.
+
+    Not simply the nearest point's, because that is discontinuous. On the
+    concave side of a bend a point is equidistant from two stretches of the path
+    whose arc positions are far apart, and taking the nearest outright makes the
+    weight jump across that tie line - a hard band through the mesh that no
+    amount of smoothing removes (it diffuses as 1/sqrt(passes): twenty passes
+    only takes a 0.52 step down to 0.07, and blurs everything else on the way).
+
+    So segments share the answer in proportion to how close they are to the
+    nearest one, with the share falling to zero at `BLEND_FRACTION` of the path
+    beyond it. Nothing enters or leaves the blend with a step, so the field is
+    continuous everywhere. Where one segment is clearly nearest - which is most
+    of the mesh - it takes the whole share and nothing changes.
+
+    Handles are untouched by this: at a bend the two segments meeting there
+    both report that corner's arc position, so they agree exactly and blending
+    them changes nothing.
     """
     if len(points) < 2:
         raise ValueError("A path needs at least two handles")
@@ -192,19 +280,19 @@ def path_factor(co, points, metrics=None):
     if not total:
         raise ValueError("Start and end are the same point")
 
-    # Ties keep the first: a path that folds back can put a vertex exactly
-    # equidistant from two segments, and the array version resolves it the same
-    # way, so the two cannot disagree.
-    candidates = range(len(lengths))
+    projected = [
+        _project(co, points[index], points[index + 1])
+        for index in range(len(lengths))
+    ]
+    nearest = math.sqrt(min(distance_sq for _t, distance_sq in projected))
+    band = total * BLEND_FRACTION
 
-    best_distance_sq = None
-    best_arc = 0.0
-    for index in candidates:
-        t, distance_sq = _project(co, points[index], points[index + 1])
-        if best_distance_sq is None or distance_sq < best_distance_sq:
-            best_distance_sq = distance_sq
-            best_arc = offsets[index] + t * lengths[index]
-    return _clamp(best_arc / total)
+    numerator = denominator = 0.0
+    for index, (t, distance_sq) in enumerate(projected):
+        share = _clamp(1.0 - (math.sqrt(distance_sq) - nearest) / band) ** 2
+        numerator += share * (offsets[index] + t * lengths[index])
+        denominator += share
+    return _clamp(numerator / denominator / total)
 
 
 def raw_factors(coords, points, shape, metrics=None):
@@ -220,6 +308,9 @@ def raw_factors(coords, points, shape, metrics=None):
     5.5 million interpreter steps - and it drops the bound the accelerator
     needed to be careful about, because nothing is being excluded any more.
 
+    See `path_factor` for why near-tied segments share the answer rather than
+    the nearest taking it outright.
+
     numpy is bundled with Blender, so this adds no dependency.
     """
     import numpy as np
@@ -234,30 +325,38 @@ def raw_factors(coords, points, shape, metrics=None):
         if not total:
             raise ValueError("Start and end are the same point")
 
-        best_d2 = np.full(len(coords), np.inf)
-        best_arc = np.zeros(len(coords))
-        for index in range(len(path) - 1):
-            a, b = path[index], path[index + 1]
-            direction = b - a
+        def project(index):
+            """Distance and arc position for one segment, every vertex at once."""
+            a = path[index]
+            direction = path[index + 1] - a
             length_sq = direction @ direction
-            offset = coords - a
             if length_sq == 0.0:
                 t = np.zeros(len(coords))
             else:
-                t = np.clip((offset @ direction) / length_sq, 0.0, 1.0)
+                t = np.clip(((coords - a) @ direction) / length_sq, 0.0, 1.0)
             # Same arithmetic in the same order as _project, not merely the same
-            # algebra: on a path that folds back a vertex can be exactly
-            # equidistant from three segments, and then which one wins is
-            # decided by the last bit. `(co - a) - t*d` and `co - (a + t*d)`
-            # round differently and pick different segments.
+            # algebra: `(co - a) - t*d` and `co - (a + t*d)` round differently,
+            # and the two implementations have to agree to the last bit.
             gap = coords - (a + t[:, None] * direction)
-            d2 = np.einsum('ij,ij->i', gap, gap)
-            # Strictly less, so an exact tie keeps the lower index - the same
-            # rule the scalar scan follows, and one a fold-back path can hit.
-            better = d2 < best_d2
-            best_d2 = np.where(better, d2, best_d2)
-            best_arc = np.where(better, offsets[index] + t * lengths[index], best_arc)
-        return np.clip(best_arc / total, 0.0, 1.0)
+            return np.einsum('ij,ij->i', gap, gap), offsets[index] + t * lengths[index]
+
+        # Two passes rather than one, so the blend never has to hold a
+        # segments-by-vertices array: at 372 segments and 65k verts that would be
+        # 400MB. Costs exactly double the projections, which is the whole cost.
+        nearest = np.full(len(coords), np.inf)
+        for index in range(len(path) - 1):
+            np.minimum(nearest, project(index)[0], out=nearest)
+        np.sqrt(nearest, out=nearest)
+
+        band = total * BLEND_FRACTION
+        numerator = np.zeros(len(coords))
+        denominator = np.zeros(len(coords))
+        for index in range(len(path) - 1):
+            d2, arc = project(index)
+            share = np.clip(1.0 - (np.sqrt(d2) - nearest) / band, 0.0, 1.0) ** 2
+            numerator += share * arc
+            denominator += share
+        return np.clip(numerator / denominator / total, 0.0, 1.0)
 
     start, end = path[0], path[-1]
     direction = end - start
@@ -316,14 +415,20 @@ def value(t, profile='LINEAR', midpoint=0.5, invert=False, curve=None):
     read its ColorRamp. Without one the named profile and midpoint apply, which
     is what the scripting operator uses - an operator property cannot hold a
     ColorRamp.
+
+    `invert` negates the weight, it does not mirror the position. Those are the
+    same thing only for a profile that happens to be symmetric: `sqrt(1 - t)` is
+    not `1 - sqrt(t)`, so mirroring left Root and its inverse summing to
+    anything but one. Negating means a gradient and its inverse always add up to
+    exactly 1 everywhere, whatever shape either of them is.
     """
-    if invert:
-        t = 1.0 - t
     if curve is not None:
-        return _clamp(curve(t))
-    if midpoint != 0.5:
-        t = _remap_midpoint(t, midpoint)
-    return _clamp(_PROFILE_CURVES[profile](t))
+        result = _clamp(curve(t))
+    else:
+        if midpoint != 0.5:
+            t = _remap_midpoint(t, midpoint)
+        result = _clamp(_PROFILE_CURVES[profile](t))
+    return 1.0 - result if invert else result
 
 
 def factor(

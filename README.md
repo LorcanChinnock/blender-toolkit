@@ -184,7 +184,19 @@ either — it starts the next one, which is the point of Add.
 
 A gradient is a **path**, not just two points. `t` is each vertex's position
 along the *arc length*, so past a bend the weight follows the bend rather than
-the straight line. Two handles behaves exactly like a plain linear ramp.
+the straight line.
+
+Where two stretches of the path are about equally close, they **share** a
+vertex rather than the nearer one taking it outright. Taking the nearest
+outright is what produces hard bands on the concave side of a bend: a vertex
+there is equidistant from two stretches whose positions along the path are far
+apart, and the weight jumps across that tie line. Sharing removes the jump
+entirely; away from a bend one stretch is clearly nearest and nothing changes.
+Handles are unaffected either way — the two segments meeting at a bend both
+report that corner, so they already agree.
+
+Smoothing is not an alternative here: it diffuses a step as 1/√passes, so on a
+0.50 jump twenty passes only reached 0.07 while blurring everything else. Two handles behaves exactly like a plain linear ramp.
 **Curved** smooths the path through the handles instead of running straight
 between them.
 
@@ -195,10 +207,15 @@ rather than one this add-on imposes. Handles are positioned by dragging in the v
 coordinates. Adding a stop in the middle inserts a handle in the middle, and
 handles you've already dragged stay put.
 
-They're coupled in **number, not in position**. Dragging a stop sideways moves
-where its value lands along the path and rewrites the weights; it does not drag
-the handle it was seeded from. The ramp is the value profile, the handles are the
-shape of the path.
+**A stop's position on the bar is its handle's weight.** Slide it right and that
+handle weighs more; the handle recolours to match and moves nowhere in the
+viewport. Where a handle falls *along the path* is the handle's own business —
+you dragged it there in 3D — so the two controls never fight over it.
+
+One consequence: the widget keeps stops in order and handles are matched to them
+in path order, so weights run **monotonically** along the path. Dragging one stop
+past another swaps which handle owns which weight. For a peak in the middle, use
+the **Band** shape or a second gradient with a mask.
 
 Spherical and Band only read the first and last handle, so the panel stops
 offering the ones in between.
@@ -222,17 +239,20 @@ add and remove stops, and therefore handles — that native add/remove is why it
 a colour ramp widget rather than a curve one, and why there is no second handle
 list to keep in step with it.
 
-It's a **weight picker, not a colour picker**, and it's shown on weight paint's
-own scale: blue → cyan → green → yellow → red. Pick a colour and it snaps to the
-weight colour nearest it, so every colour in the ramp stands for a weight and
-alpha can't quietly scale the result.
+The bar is a **fixed scale you read a weight off** — weight paint's own, blue →
+cyan → green → yellow → red — not a colour picker. A stop's colour is simply the
+scale's colour where it sits, so there is nothing to choose: Blender's widget
+still opens a picker, but whatever you pick is overwritten on the next poll.
 
 That works because weight paint's ramp is a sweep of hue at full saturation —
-one number. The ramp is held in **HSV / Counter-Clockwise**, where two stops
-interpolate through cyan, green and yellow exactly as weight paint does, and the
-weight blends linearly between them. In the ordinary RGB mode blue → red runs
-through purple instead, which is no weight at all; the mode dropdowns are part
-of the widget, so switching them is undone on the next poll.
+one number. The ramp is held in **HSV / Counter-Clockwise**, where the bar
+renders as the true scale. In the ordinary RGB mode blue → red runs through
+purple instead, which is no weight at all; the mode dropdowns are part of the
+widget, so switching them is undone too.
+
+The weight *between* handles is a straight line from one to the next, so the
+profile is as many segments as you have handles. Past the outermost handle it
+holds flat — a handle is a control point, not a boundary.
 
 Blender lets a ramp drop to a single stop; a gradient needs two ends, so the
 floor here is **two** — remove past it and the missing stop reappears at the far
@@ -247,7 +267,7 @@ weight crosses 0.5.
 | --- | --- |
 | **Smooth** | Relaxation passes over the finished weights. |
 | **Mask** | Give it a vertex group and weights are only written where that group has weight. Outside it, existing weights are untouched; a soft mask edge blends old into new. The protected region is **tinted red in the viewport**, so a low weight there reads as masked rather than as the gradient reaching zero. |
-| **Invert** | Flips the falloff. One run writes one group — for a pair, Add, Invert, rename, Add. |
+| **Invert** | Negates every weight, and moves the stops to where those weights now read on the bar. A gradient and its inverse add up to **exactly 1** at every vertex, so the pair is genuinely complementary — Add, Invert, rename, Add. |
 
 #### Where the handles start
 

@@ -275,10 +275,13 @@ def test_gradient_maths():
         assert all(b >= a - 1e-9 for a, b in zip(values, values[1:])), name
         if name != 'CONSTANT':
             assert values[0] == 0.0 and abs(values[-1] - 1.0) < 1e-9, name
-        # Invert mirrors the direction - profile(1-t), not 1-profile(t) - so it
-        # matches the handle colours swapping ends.
-        assert abs(f(0.7, profile=name, invert=True)
-                   - f(2.0 - 0.7, profile=name)) < 1e-9, name
+        # Invert negates the weight rather than mirroring the position, so a
+        # gradient and its inverse add to exactly 1 - even for a profile that
+        # is not symmetric, where sqrt(1 - t) is nothing like 1 - sqrt(t).
+        for x in (0.0, 0.3, 0.7, 1.4, 2.0):
+            straight = f(x, profile=name)
+            flipped = f(x, profile=name, invert=True)
+            assert abs(straight + flipped - 1.0) < 1e-9, (name, x)
 
     # A curve callable replaces the named profile; the session passes its ramp.
     assert abs(f(0.5, curve=lambda t: t * t) - 0.0625) < 1e-9
@@ -517,8 +520,9 @@ def test_snapping_follows_the_cursor():
 
 
 def test_handles_follow_ramp_stops():
-    """The gradient is the single control for how many handles there are."""
-    from blender_toolkit.tools.weights import properties
+    """The gradient is the single control for how many handles there are, and a
+    stop's position on the bar is its handle's weight."""
+    from blender_toolkit.tools.weights import gradient, properties
 
     reset()
     obj = _grid_with_key()
@@ -526,41 +530,42 @@ def test_handles_follow_ramp_stops():
     assert bpy.ops.tk.start_gradient(source='BOUNDS', axis='X') == {'FINISHED'}
     stops = properties.ramp_of(settings).elements
     assert len(settings.handles) == len(stops) == 2
+    assert [h.weight for h in settings.handles] == [0.0, 1.0]
 
-    # A new stop grows a handle, seeded where it sits along the path - and in
-    # stop order, so a stop in the middle is a handle in the middle.
+    # A new stop grows a handle, seeded midway between its neighbours.
+    ends = [tuple(h.position) for h in settings.handles]
     stops.new(0.5)
     assert properties.sync_handles_to_ramp(settings) is True
     assert len(settings.handles) == 3
-    assert [round(h.t, 3) for h in settings.handles] == [0.0, 0.5, 1.0]
-    assert abs(settings.handles[1].position.x) < 1e-6, settings.handles[1].position
+    assert [round(h.weight, 3) for h in settings.handles] == [0.0, 0.5, 1.0]
+    middle = Vector(settings.handles[1].position)
+    assert (middle - (Vector(ends[0]) + Vector(ends[1])) * 0.5).length < 1e-6
+    assert tuple(settings.handles[0].position) == ends[0]
+    assert tuple(settings.handles[2].position) == ends[1]
 
     # Idempotent: nothing changed, so nothing to do.
     assert properties.sync_handles_to_ramp(settings) is False
 
-    # Dragging a handle must survive the next stop being added.
+    # Dragging a handle in 3D must survive the next stop being added.
     settings.handles[1].position = (0.0, 0.7, 0.0)
     stops.new(0.75)
     assert properties.sync_handles_to_ramp(settings) is True
     assert len(settings.handles) == 4
-    assert [round(h.t, 3) for h in settings.handles] == [0.0, 0.5, 0.75, 1.0]
+    assert [round(h.weight, 3) for h in settings.handles] == [0.0, 0.5, 0.75, 1.0]
     assert abs(settings.handles[1].position.y - 0.7) < 1e-6  # kept, not reseeded
-    assert settings.handles[2].position.x > 0.0  # the new one, past the middle
 
-    # Dragging a stop sideways is a value edit, not a handle move: nothing on
-    # the path may shift, and the handle still tracks its stop.
+    # Sliding a stop sets that handle's weight and moves nothing in 3D.
     before = [tuple(h.position) for h in settings.handles]
     stops[2].position = 0.6
     assert properties.sync_handles_to_ramp(settings) is False
     assert [tuple(h.position) for h in settings.handles] == before
-    assert [round(h.t, 3) for h in settings.handles] == [0.0, 0.5, 0.6, 1.0]
-
-    # So a later add still lands in the right place rather than treating every
-    # stop as new.
-    stops.new(0.9)
-    properties.sync_handles_to_ramp(settings)
-    assert len(settings.handles) == 5
-    assert [tuple(h.position) for h in settings.handles[:3]] == before[:3]
+    assert [round(h.weight, 3) for h in settings.handles] == [0.0, 0.5, 0.6, 1.0]
+    # And the handle recolours to the weight it now carries.
+    assert all(
+        abs(a - b) < 1e-6 for a, b in zip(
+            properties.handle_colours(settings)[2], gradient.weight_colour(0.6)
+        )
+    ), properties.handle_colours(settings)[2]
 
     # Removing stops takes the handles with them.
     while len(stops) > 2:
@@ -590,10 +595,12 @@ def test_ramp_edits_are_noticed():
     overlay._sync()
     assert properties.take_dirty() is False, "_sync writes and clears the flag"
 
-    # Moving a stop rewrites the weights: 0..0.25 is now solid black.
+    # Moving a stop is a weight edit, and the weights follow it: the low end of
+    # the gradient now bottoms out at 0.25 rather than at zero.
+    assert abs(settings.handles[0].weight - 0.25) < 1e-6
     group = obj.vertex_groups[settings.group_name]
     low = min(obj.data.vertices, key=lambda v: v.co.x)
-    assert group.weight(low.index) == 0.0
+    assert abs(group.weight(low.index) - 0.25) < 1e-5, group.weight(low.index)
     bpy.ops.tk.cancel_gradient()
 
 
@@ -623,60 +630,155 @@ def test_cancel_resets_the_session():
     bpy.ops.tk.cancel_gradient()
 
 
-def test_point_at_walks_the_path():
-    from blender_toolkit.tools.weights import operators, properties
+def test_handle_arc_positions():
+    """Where a handle sits along the path, taken from the polyline's shape.
 
-    reset()
-    obj = _grid_with_key()
-    settings = obj.tk_gradient
-    # An L of two equal legs, so arc position and straight distance differ.
-    operators.set_handles(settings, [(0, 0, 0), (2, 0, 0), (2, 2, 0)])
+    path_factor is the wrong tool for this and the reason the helper exists: it
+    returns the nearest point on the *whole* path, so a handle that folds back
+    onto an earlier stretch reports that stretch's position instead of its own.
+    """
+    from blender_toolkit.tools.weights import gradient
 
-    assert (properties.point_at(settings, 0.0) - Vector((0, 0, 0))).length < 1e-6
-    assert (properties.point_at(settings, 0.5) - Vector((2, 0, 0))).length < 1e-6
-    assert (properties.point_at(settings, 0.25) - Vector((1, 0, 0))).length < 1e-6
-    assert (properties.point_at(settings, 0.75) - Vector((2, 1, 0))).length < 1e-6
-    assert (properties.point_at(settings, 1.0) - Vector((2, 2, 0))).length < 1e-6
+    handles = [(0, 0, 0), (1, 0, 0), (3, 0, 0)]
+    for curved in (False, True):
+        points = gradient.path_points(handles, curved=curved)
+        arcs = gradient.handle_arc_positions(points, len(handles), curved=curved)
+        assert arcs[0] == 0.0 and abs(arcs[-1] - 1.0) < 1e-9, arcs
+        assert all(b > a for a, b in zip(arcs, arcs[1:])), arcs
+        # Evenly spaced in *arc length*, not in index: the second gap is twice
+        # the first, so the middle handle lands a third of the way along.
+        assert abs(arcs[1] - 1.0 / 3.0) < 1e-6, arcs
+
+    # A path that returns exactly to where it started. The last handle is at the
+    # far end of the arc; path_factor cannot tell it from the first.
+    doubled = [(0, 0, 0), (1, 0, 0), (0, 0, 0)]
+    points = gradient.path_points(doubled)
+    arcs = gradient.handle_arc_positions(points, 3)
+    assert arcs == [0.0, 0.5, 1.0], arcs
+    # path_factor cannot tell the two ends apart - it sees one point equidistant
+    # from both stretches and blends them to the middle. That is exactly the
+    # confusion handle_arc_positions exists to avoid.
+    assert abs(gradient.path_factor(doubled[-1], points) - 0.5) < 1e-6, (
+        gradient.path_factor(doubled[-1], points)
+    )
+
+    # Coincident handles mid-drag divide by nothing; spread rather than crash.
+    flat = [(1, 1, 1)] * 3
+    assert gradient.handle_arc_positions(gradient.path_points(flat), 3) == [
+        0.0, 0.5, 1.0
+    ]
+
+
+def test_path_field_is_continuous():
+    """No hard bands on the concave side of a bend.
+
+    Taking the nearest segment outright is discontinuous: at a bend a point is
+    equidistant from two stretches whose arc positions are far apart, and the
+    weight jumps across that tie line. Smoothing cannot fix it - it diffuses as
+    1/sqrt(passes), so twenty passes took a 0.52 step only down to 0.07.
+    """
+    from blender_toolkit.tools.weights import gradient
+
+    zigzag = [(-2, 0, 0), (-1, 0.5, 0), (0, -0.2, 0), (1, 0.5, 0), (2, 0, 0)]
+    points = gradient.path_points(zigzag)
+    metrics = gradient.segment_lengths(points)
+    at = lambda x, y: gradient.path_factor((x, y, 0.0), points, metrics)
+
+    for y in (-1.5, -1.0, -0.5, 0.0, 0.5, 0.9):
+        samples = [(-2.5 + 5.0 * i / 400, y) for i in range(401)]
+        values = [at(x, y) for x, y in samples]
+        index = max(range(400), key=lambda k: abs(values[k + 1] - values[k]))
+        # Squeeze the widest step down to nothing. A steep gradient shrinks with
+        # the bracket; a jump would not.
+        low, high = samples[index][0], samples[index + 1][0]
+        a, b = values[index], values[index + 1]
+        for _ in range(60):
+            mid = 0.5 * (low + high)
+            value = at(mid, y)
+            if abs(value - a) >= abs(b - value):
+                high, b = mid, value
+            else:
+                low, a = mid, value
+        assert abs(b - a) < 1e-9, f"y={y} still steps by {abs(b - a)}"
+
+    # A handle is not smeared by its neighbours: the two segments meeting at a
+    # bend both report that corner's arc position, so they agree exactly.
+    arcs = gradient.handle_arc_positions(points, len(zigzag))
+    for handle, arc in zip(zigzag, arcs):
+        assert abs(at(handle[0], handle[1]) - arc) < 1e-9, handle
+
+
+def test_weight_curve():
+    """Piecewise-linear through the handles, flat outside the outermost."""
+    from blender_toolkit.tools.weights import gradient
+
+    curve = gradient.weight_curve([(0.0, 0.0), (0.5, 0.9), (1.0, 1.0)])
+    assert curve(0.0) == 0.0 and curve(1.0) == 1.0
+    assert abs(curve(0.25) - 0.45) < 1e-9
+    assert abs(curve(0.75) - 0.95) < 1e-9
+    # Held flat past the ends, and unsorted knots are sorted first.
+    assert curve(-1.0) == 0.0 and curve(2.0) == 1.0
+    assert gradient.weight_curve([(1.0, 1.0), (0.0, 0.2)])(0.0) == 0.2
+    # Two handles at the same place along the path must not divide by zero.
+    # Which of the two wins is arbitrary; that it answers at all is not.
+    assert gradient.weight_curve([(0.5, 0.1), (0.5, 0.8)])(0.5) == 0.1
+    assert gradient.weight_curve([(0.0, 0.0), (0.5, 0.1), (0.5, 0.8)])(0.5) == 0.8
+    assert gradient.weight_curve([]) is None
+    assert gradient.weight_curve([(0.3, 0.4)])(0.9) == 0.4
 
 
 def test_ramp_values():
+    """The curve is built from the handles, not read off the ramp."""
     from blender_toolkit.tools.weights import gradient, properties
 
     reset()
     obj = _grid_with_key()
     settings = obj.tk_gradient
-    ramp = properties.ensure_ramp(settings).color_ramp
+    assert bpy.ops.tk.start_gradient(source='BOUNDS', axis='X') == {'FINISHED'}
+    ramp = properties.ramp_of(settings)
     assert len(ramp.elements) == 2
-    # The ends are weight paint's own ends, not black and white.
+    # The bar's ends are weight zero and weight one.
     assert tuple(ramp.elements[0].color) == gradient.weight_colour(0.0)
     assert tuple(ramp.elements[-1].color) == gradient.weight_colour(1.0)
     assert ramp.color_mode == 'HSV' and ramp.hue_interpolation == 'CCW'
 
-    ramp.elements.new(0.5).color = gradient.weight_colour(0.25)
-    curve = properties.ramp_curve(settings)
-    for t in (0.0, 0.25, 0.5, 0.75, 1.0):
-        assert abs(curve(t) - gradient.weight_of(ramp.evaluate(t))) < 1e-6, t
-    assert abs(curve(0.5) - 0.25) < 1e-5
+    # A third handle, three-quarters of the way along, weighing 0.25.
+    ramp.elements.new(0.25)
+    properties.sync_handles_to_ramp(settings)
+    assert len(settings.handles) == 3
+    ends = [Vector(settings.handles[0].position), Vector(settings.handles[2].position)]
+    settings.handles[1].position = ends[0] + (ends[1] - ends[0]) * 0.75
 
-    # The weight blends linearly between stops. An RGB ramp could not do this:
-    # blue to red the ordinary way runs through purple, which is no weight.
-    assert abs(curve(0.25) - 0.125) < 1e-4, curve(0.25)
-    assert abs(curve(0.75) - 0.625) < 1e-4, curve(0.75)
+    points = properties.path_of(settings)
+    assert [round(a, 3) for a in properties.handle_arcs(settings, points)] == [
+        0.0, 0.75, 1.0
+    ]
+    curve = properties.ramp_curve(settings, points)
+    # Knots at (0, 0), (0.75, 0.25) and (1, 1): the weight ramps slowly to the
+    # third handle and then races. The ramp widget knows nothing about this -
+    # the stop only said "0.25", the handle said where.
+    assert abs(curve(0.0) - 0.0) < 1e-6
+    assert abs(curve(0.375) - 0.125) < 1e-5
+    assert abs(curve(0.75) - 0.25) < 1e-5
+    assert abs(curve(0.875) - 0.625) < 1e-5
+    assert abs(curve(1.0) - 1.0) < 1e-6
 
     path = [(0, 0, 0), (2, 0, 0)]
     assert abs(gradient.factor((1, 0, 0), path, curve=curve) - curve(0.5)) < 1e-6
-    # Inverting reads the gradient mirrored.
-    assert abs(
-        gradient.factor((0.5, 0, 0), path, curve=curve, invert=True) - curve(0.75)
-    ) < 1e-6
+    # Inverting negates: the pair adds to 1 wherever you sample it.
+    for co in ((0.0, 0, 0), (0.5, 0, 0), (1.3, 0, 0), (2.0, 0, 0)):
+        straight = gradient.factor(co, path, curve=curve)
+        flipped = gradient.factor(co, path, curve=curve, invert=True)
+        assert abs(straight + flipped - 1.0) < 1e-6, co
 
     settings.use_ramp = False
     assert properties.ramp_curve(settings) is None  # falls back to the profile
     settings.use_ramp = True
+    bpy.ops.tk.cancel_gradient()
 
 
-def test_ramp_is_a_weight_picker():
-    """Every colour in the ramp stands for a weight, however it was edited."""
+def test_ramp_is_a_weight_scale():
+    """The bar is a fixed scale you read a weight off, not a colour picker."""
     from blender_toolkit.tools.weights import gradient, properties
 
     reset()
@@ -684,27 +786,28 @@ def test_ramp_is_a_weight_picker():
     settings = obj.tk_gradient
     ramp = properties.ensure_ramp(settings).color_ramp
 
-    # A colour picked in the widget snaps to the weight colour it is nearest,
-    # so nothing off the scale can survive in the ramp.
+    # A stop's colour is the scale's colour at its position, whatever was
+    # picked. That is what makes Blender's own picker inert.
+    ramp.elements[0].position = 0.4
     ramp.elements[0].color = (0.9, 0.3, 0.0, 0.5)
     assert properties.normalise_ramp(settings) is True
-    snapped = tuple(ramp.elements[0].color)
-    assert snapped == gradient.weight_colour(gradient.weight_of(snapped))
-    assert snapped[3] == 1.0  # opaque, so alpha cannot quietly scale the weight
+    position = ramp.elements[0].position
+    assert tuple(ramp.elements[0].color) == gradient.weight_colour(position)
+    assert abs(gradient.weight_of(ramp.elements[0].color) - 0.4) < 1e-6
 
     # Idempotent: already on the scale, nothing to do.
     assert properties.normalise_ramp(settings) is False
 
-    # Switching the widget's own dropdowns back off HSV is undone: in RGB the
-    # ramp would interpolate blue to red through purple.
+    # Moving the stop recolours it, because the colour is the position.
+    ramp.elements[0].position = 0.8
+    assert properties.normalise_ramp(settings) is True
+    assert abs(gradient.weight_of(ramp.elements[0].color) - 0.8) < 1e-6
+
+    # Switching the widget's own dropdowns off HSV is undone: in RGB the bar
+    # would run blue to red through purple, which is no weight at all.
     ramp.color_mode = 'RGB'
     assert properties.normalise_ramp(settings) is True
     assert ramp.color_mode == 'HSV' and ramp.hue_interpolation == 'CCW'
-
-    # A ramp saved when this was a greyscale picker still means what it meant.
-    ramp.elements[0].color = (0.25, 0.25, 0.25, 1.0)
-    properties.normalise_ramp(settings)
-    assert abs(gradient.weight_of(ramp.elements[0].color) - 0.25) < 1e-6
 
     # Blender's own floor is one stop; ours is two.
     ramp.elements.remove(ramp.elements[0])
@@ -885,6 +988,115 @@ def test_factor_cache_matches_the_long_way_round():
             settings.shape, settings.curved
         )
 
+    bpy.ops.tk.cancel_gradient()
+
+
+def test_record_formats_still_load():
+    """Three handle shapes have been written; all three must still mean it."""
+    from blender_toolkit.tools.weights import properties
+
+    reset()
+    obj = _grid_with_key()
+    settings = obj.tk_gradient
+    assert bpy.ops.tk.start_gradient(source='BOUNDS', axis='X') == {'FINISHED'}
+
+    base = {key: getattr(settings, key) for key in properties.RECORDED}
+    positions = [(-1.0, 0.0, 0.0), (0.0, 0.5, 0.0), (1.0, 0.0, 0.0)]
+
+    # Current: weight first, then the position.
+    obj[properties.RECORD_KEY] = {"Now": {
+        **base, "handles": [[w, *p] for w, p in zip((0.0, 0.4, 1.0), positions)],
+    }}
+    assert properties.load_record(obj, settings, "Now") is True
+    assert [round(h.weight, 3) for h in settings.handles] == [0.0, 0.4, 1.0]
+
+    # Previous: t first, weights in a separate "stops" list.
+    obj[properties.RECORD_KEY] = {"Then": {
+        **base,
+        "handles": [[t, *p] for t, p in zip((0.0, 0.5, 1.0), positions)],
+        "stops": [[0.0, 0.0], [0.5, 0.3], [1.0, 1.0]],
+    }}
+    assert properties.load_record(obj, settings, "Then") is True
+    assert [round(h.weight, 3) for h in settings.handles] == [0.0, 0.3, 1.0]
+
+    # Oldest: bare positions, no weight stored at all - spread them evenly.
+    obj[properties.RECORD_KEY] = {"Oldest": {
+        **base, "handles": [list(p) for p in positions],
+    }}
+    assert properties.load_record(obj, settings, "Oldest") is True
+    assert [round(h.weight, 3) for h in settings.handles] == [0.0, 0.5, 1.0]
+
+    # Every one of them leaves the ramp matching the handles it loaded.
+    stops = sorted(e.position for e in properties.ramp_of(settings).elements)
+    assert [round(x, 3) for x in stops] == [0.0, 0.5, 1.0]
+    assert [tuple(round(c, 3) for c in h.position) for h in settings.handles] == [
+        tuple(round(c, 3) for c in p) for p in positions
+    ]
+    bpy.ops.tk.cancel_gradient()
+
+
+def test_invert_negates_and_moves_the_stops():
+    """Invert flips every weight, and the bar follows.
+
+    The pair must add to 1 at every vertex - that is what makes a gradient and
+    its inverse a complementary pair of groups rather than two related ones.
+    """
+    from blender_toolkit.tools.weights import gradient, properties
+
+    reset()
+    obj = _grid_with_key()
+    settings = obj.tk_gradient
+    assert bpy.ops.tk.start_gradient(source='BOUNDS', axis='X') == {'FINISHED'}
+
+    # Three handles with a deliberately lopsided profile, so mirroring the
+    # position and negating the weight cannot be confused for each other.
+    ramp = properties.ramp_of(settings)
+    ramp.elements.new(0.2)
+    properties.sync_handles_to_ramp(settings)
+    flush(obj)
+    straight = [
+        obj.vertex_groups[settings.group_name].weight(v.index)
+        for v in obj.data.vertices
+    ]
+    shown = properties.handle_values(settings)
+    assert [round(v, 3) for v in shown] == [0.0, 0.2, 1.0]
+
+    settings.invert = True
+    flush(obj)
+
+    # Every handle's weight is negated, and its colour with it.
+    assert [round(v, 3) for v in properties.handle_values(settings)] == [
+        1.0, 0.8, 0.0
+    ]
+    assert properties.handle_colours(settings)[0] == gradient.weight_colour(1.0)
+
+    # The stops moved to where those weights now read on the bar.
+    assert [round(e.position, 3) for e in sorted(
+        ramp.elements, key=lambda e: e.position
+    )] == [0.0, 0.8, 1.0]
+
+    # And the mesh: original plus inverted is 1 everywhere.
+    flipped = [
+        obj.vertex_groups[settings.group_name].weight(v.index)
+        for v in obj.data.vertices
+    ]
+    assert all(abs(a + b - 1.0) < 1e-5 for a, b in zip(straight, flipped)), [
+        (a, b) for a, b in zip(straight, flipped) if abs(a + b - 1.0) >= 1e-5
+    ][:3]
+
+    # Toggling back is exactly the identity, stops included.
+    settings.invert = False
+    flush(obj)
+    assert [round(v, 3) for v in properties.handle_values(settings)] == [
+        round(v, 3) for v in shown
+    ]
+    assert all(
+        abs(a - b) < 1e-6
+        for a, b in zip(straight, (
+            obj.vertex_groups[settings.group_name].weight(v.index)
+            for v in obj.data.vertices
+        ))
+    )
     bpy.ops.tk.cancel_gradient()
 
 

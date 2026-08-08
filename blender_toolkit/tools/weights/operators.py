@@ -77,13 +77,13 @@ def _seed_points(operator, context, obj):
 
 
 def set_handles(settings, points):
-    """Replace the path with the given points, spread evenly across the ramp."""
+    """Replace the path with the given points, weights spread evenly."""
     settings.handles.clear()
     last = max(len(points) - 1, 1)
     for index, point in enumerate(points):
         handle = settings.handles.add()
         handle.position = point
-        handle.t = index / last
+        handle.weight = index / last
     settings.active_handle = 0
 
 
