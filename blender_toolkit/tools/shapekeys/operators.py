@@ -2,9 +2,6 @@ import bpy
 
 from ...utils import ensure_mode
 
-LEFT_GROUP = "Left"
-RIGHT_GROUP = "Right"
-
 
 def _activate(context, obj):
     bpy.ops.object.select_all(action='DESELECT')
@@ -97,41 +94,102 @@ class TK_OT_apply_modifiers_shapekeys(bpy.types.Operator):
 
 
 class TK_OT_split_shapekey(bpy.types.Operator):
-    """Split the active shapekey into _L and _R halves masked by vertex groups"""
+    """Split a shapekey into two, each weighted by one of a pair of vertex groups
+
+    The weights are baked into the coordinates rather than left as a live
+    ShapeKey.vertex_group mask, so the results can be split again.
+    """
 
     bl_idname = "tk.split_shapekey"
-    bl_label = "Split Shapekey L/R"
+    bl_label = "Split Shapekey"
     bl_options = {'REGISTER', 'UNDO'}
+
+    key: bpy.props.StringProperty(
+        name="Shapekey",
+        description="Key to split. Empty uses the active one",
+    )
+    group_a: bpy.props.StringProperty(name="Group A", default="Left")
+    group_b: bpy.props.StringProperty(name="Group B", default="Right")
+    suffix_a: bpy.props.StringProperty(name="Suffix A", default="_L")
+    suffix_b: bpy.props.StringProperty(name="Suffix B", default="_R")
+    keep_source: bpy.props.BoolProperty(
+        name="Keep Source",
+        description="Leave the key that was split in place",
+        default=True,
+    )
 
     @classmethod
     def poll(cls, context):
         obj = context.active_object
+        # Not active_shape_key_index > 0: `key` can name any key, and removing a
+        # source with keep_source off drops the active index back to the Basis.
         return (
             obj is not None
             and obj.type == 'MESH'
             and obj.data.shape_keys is not None
-            and obj.active_shape_key_index > 0
+            and len(obj.data.shape_keys.key_blocks) > 1
         )
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    def draw(self, context):
+        obj = context.active_object
+        layout = self.layout
+        layout.use_property_split = True
+        layout.prop_search(self, "key", obj.data.shape_keys, "key_blocks")
+        layout.prop_search(self, "group_a", obj, "vertex_groups")
+        layout.prop(self, "suffix_a")
+        layout.prop_search(self, "group_b", obj, "vertex_groups")
+        layout.prop(self, "suffix_b")
+        layout.prop(self, "keep_source")
 
     def execute(self, context):
         obj = context.active_object
-        missing = [g for g in (LEFT_GROUP, RIGHT_GROUP) if g not in obj.vertex_groups]
+        keys = obj.data.shape_keys.key_blocks
+
+        source = keys.get(self.key) if self.key else obj.active_shape_key
+        if source is None:
+            self.report({'ERROR'}, f"No shapekey named '{self.key}'")
+            return {'CANCELLED'}
+        if source == source.relative_key:
+            self.report({'ERROR'}, f"'{source.name}' is a base key - nothing to split")
+            return {'CANCELLED'}
+
+        missing = [g for g in (self.group_a, self.group_b) if g not in obj.vertex_groups]
         if missing:
             self.report({'ERROR'}, f"Missing vertex group(s): {', '.join(missing)}")
             return {'CANCELLED'}
 
-        source = obj.active_shape_key
+        reference = source.relative_key
         with ensure_mode(context, 'OBJECT'):
-            for suffix, group in (("_L", LEFT_GROUP), ("_R", RIGHT_GROUP)):
+            # VertexGroup.weight() raises for vertices outside the group, so read
+            # the memberships off the mesh instead.
+            per_vertex = [
+                {g.group: g.weight for g in v.groups} for v in obj.data.vertices
+            ]
+            for suffix, name in (
+                (self.suffix_a, self.group_a),
+                (self.suffix_b, self.group_b),
+            ):
+                group = obj.vertex_groups[name]
                 new_key = obj.shape_key_add(name=f"{source.name}{suffix}", from_mix=False)
-                for target, original in zip(new_key.data, source.data):
-                    target.co = original.co
-                new_key.vertex_group = group
+                for index, groups in enumerate(per_vertex):
+                    weight = groups.get(group.index, 0.0)
+                    base = reference.data[index].co
+                    new_key.data[index].co = base + (source.data[index].co - base) * weight
+                new_key.relative_key = reference
                 new_key.slider_min = source.slider_min
                 new_key.slider_max = source.slider_max
 
-        self.report({'INFO'}, f"Split '{source.name}' into _L / _R")
+            if not self.keep_source:
+                obj.shape_key_remove(source)
+
+        self.report(
+            {'INFO'}, f"Split into {self.suffix_a} / {self.suffix_b}"
+        )
         return {'FINISHED'}
 
 
 classes = (TK_OT_apply_modifiers_shapekeys, TK_OT_split_shapekey)
+

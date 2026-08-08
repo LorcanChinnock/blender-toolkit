@@ -24,6 +24,12 @@ class TK_AddonPreferences(bpy.types.AddonPreferences):
         default=True,
         update=_refresh_panels,
     )
+    use_weights: bpy.props.BoolProperty(
+        name="Weights",
+        description="Enable the vertex group tools",
+        default=True,
+        update=_refresh_panels,
+    )
     use_rigging: bpy.props.BoolProperty(
         name="Rigging",
         description="Enable the rigging tools",
@@ -41,6 +47,7 @@ class TK_AddonPreferences(bpy.types.AddonPreferences):
         col = self.layout.column(heading="Modules")
         col.prop(self, "use_retopo")
         col.prop(self, "use_shapekeys")
+        col.prop(self, "use_weights")
         col.prop(self, "use_rigging")
         col.prop(self, "use_export")
 

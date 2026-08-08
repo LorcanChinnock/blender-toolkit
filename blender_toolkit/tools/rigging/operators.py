@@ -133,4 +133,40 @@ class TK_OT_add_twist_bones(bpy.types.Operator):
         return {'FINISHED'}
 
 
-classes = (TK_OT_validate_humanoid, TK_OT_add_twist_bones)
+class TK_OT_toggle_pose_mode(bpy.types.Operator):
+    """Toggle pose mode on the active armature, clearing the pose both ways"""
+
+    bl_idname = "tk.toggle_pose_mode"
+    bl_label = "Pose Mode"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    reset: bpy.props.BoolProperty(
+        name="Reset Pose",
+        description="Clear every bone's transform on entering and leaving",
+        default=True,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.type == 'ARMATURE'
+
+    def execute(self, context):
+        obj = context.active_object
+        leaving = obj.mode == 'POSE'
+
+        if self.reset:
+            # Not pose.transforms_clear: that needs pose mode and only touches
+            # the selection.
+            for bone in obj.pose.bones:
+                bone.matrix_basis.identity()
+
+        bpy.ops.object.mode_set(mode='OBJECT' if leaving else 'POSE')
+
+        direction = "Left" if leaving else "Entered"
+        suffix = " (pose reset)" if self.reset else ""
+        self.report({'INFO'}, f"{direction} pose mode{suffix}")
+        return {'FINISHED'}
+
+
+classes = (TK_OT_validate_humanoid, TK_OT_add_twist_bones, TK_OT_toggle_pose_mode)

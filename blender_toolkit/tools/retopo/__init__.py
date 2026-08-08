@@ -1,13 +1,8 @@
-if "bpy" in locals():
-    import importlib
+import bpy
 
-    importlib.reload(operators)
-    importlib.reload(ui)
-else:
-    from . import operators
-    from . import ui
+from ...utils import load_submodules
 
-import bpy  # noqa: E402
+load_submodules(globals(), __package__, ("operators", "ui"))
 
 
 def register():

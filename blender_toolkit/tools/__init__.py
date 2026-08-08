@@ -1,26 +1,13 @@
-if "bpy" in locals():
-    import importlib
+import bpy
 
-    importlib.reload(retopo)
-    importlib.reload(shapekeys)
-    importlib.reload(rigging)
-    importlib.reload(export)
-else:
-    from . import retopo
-    from . import shapekeys
-    from . import rigging
-    from . import export
+from ..utils import load_submodules, prefs
 
-import bpy  # noqa: E402
+# Add a module here and to preferences.use_<name>; nothing else needs editing.
+MODULE_NAMES = ("retopo", "shapekeys", "weights", "rigging", "export")
 
-from ..utils import prefs  # noqa: E402
+load_submodules(globals(), __package__, MODULE_NAMES)
 
-MODULES = (
-    (retopo, "use_retopo"),
-    (shapekeys, "use_shapekeys"),
-    (rigging, "use_rigging"),
-    (export, "use_export"),
-)
+MODULES = tuple((globals()[name], f"use_{name}") for name in MODULE_NAMES)
 
 
 def refresh_panels():
