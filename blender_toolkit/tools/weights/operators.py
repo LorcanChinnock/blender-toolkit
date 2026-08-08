@@ -184,6 +184,15 @@ class TK_OT_write_gradient(_SourceMixin, bpy.types.Operator):
         return {'FINISHED'}
 
 
+class _SessionMixin:
+    """Only meaningful while a session is running on the active object."""
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.type == 'MESH' and obj.tk_gradient.active
+
+
 class TK_OT_start_gradient(_SourceMixin, bpy.types.Operator):
     """Build vertex group weights from a spatial gradient, adjusted live
 
@@ -193,11 +202,18 @@ class TK_OT_start_gradient(_SourceMixin, bpy.types.Operator):
 
     bl_idname = "tk.start_gradient"
     bl_label = "Weight Gradient"
-    bl_options = {'REGISTER'}
+    bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
         obj = context.active_object
-        settings = context.scene.tk_gradient
+        settings = context.active_object.tk_gradient
+
+        # Every session opens clean: last round's shape, mask and ramp are not
+        # what you want on the next group, and neither is its name. Pick a group
+        # from the panel to edit one that already exists - that loads its saved
+        # gradient - rather than inheriting whatever was left over.
+        properties.reset_settings(settings)
+        settings.group_name = properties.unused_group_name(obj)
 
         seeded, error, origin = _seed_points(self, context, obj)
         if error:
@@ -229,16 +245,15 @@ class TK_OT_start_gradient(_SourceMixin, bpy.types.Operator):
         return {'FINISHED'}
 
 
-def _end_session(context):
-    settings = context.scene.tk_gradient
+def _end_session(context, obj):
+    settings = obj.tk_gradient
     settings.active = False
     overlay.disable()
-    obj = context.active_object
-    if obj is not None and obj.mode != settings.previous_mode:
+    if obj.mode != settings.previous_mode:
         bpy.ops.object.mode_set(mode=settings.previous_mode)
 
 
-class TK_OT_add_gradient(bpy.types.Operator):
+class TK_OT_add_gradient(_SessionMixin, bpy.types.Operator):
     """Keep this group and stay in the session to build another
 
     Rename the group, adjust the gradient - invert it for the opposite side -
@@ -247,27 +262,34 @@ class TK_OT_add_gradient(bpy.types.Operator):
 
     bl_idname = "tk.add_gradient"
     bl_label = "Add"
-    bl_options = {'REGISTER'}
+    bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
-        settings = context.scene.tk_gradient
-        return settings.active and bool(settings.group_name)
+        return super().poll(context) and bool(
+            context.active_object.tk_gradient.group_name
+        )
 
     def execute(self, context):
         obj = context.active_object
-        if obj is None:
-            return {'CANCELLED'}
+        settings = obj.tk_gradient
+        # Anything still pending has to land before it is committed: writes are
+        # deferred to the session timer, and Add can arrive inside that window.
+        properties.flush(context, settings)
 
-        # Committing means dropping the undo snapshots: from here on Cancel has
+        # Committing means dropping the way back: from here on Cancel has
         # nothing to take back for the groups written so far.
-        name = context.scene.tk_gradient.group_name
+        name = settings.group_name
+        properties.save_record(obj, settings, name)
         properties.forget(obj)
-        self.report({'INFO'}, f"Kept '{name}' - rename and Add again for another")
+        self.report(
+            {'INFO'}, f"Kept '{name}' and saved its gradient - rename and Add "
+            "again for another"
+        )
         return {'FINISHED'}
 
 
-class TK_OT_cancel_gradient(bpy.types.Operator):
+class TK_OT_cancel_gradient(_SessionMixin, bpy.types.Operator):
     """Close the session, undoing anything not yet added
 
     Groups you already hit Add on are kept; only the gradient in progress is
@@ -276,24 +298,15 @@ class TK_OT_cancel_gradient(bpy.types.Operator):
 
     bl_idname = "tk.cancel_gradient"
     bl_label = "Close"
-    bl_options = {'REGISTER'}
-
-    @classmethod
-    def poll(cls, context):
-        return context.scene.tk_gradient.active
+    bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
         obj = context.active_object
-        if obj is not None:
-            properties.restore(obj)
-        _end_session(context)
-        # Cancel leaves no trace: the path and the gradient go back to their
-        # defaults rather than persisting into the next session.
-        settings = context.scene.tk_gradient
-        settings.handles.clear()
-        properties.reset_ramp(settings)
-        settings.invert = False
-        settings.curved = False
+        properties.restore(obj)
+        _end_session(context, obj)
+        # Cancel leaves no trace. Start resets too, so this is belt and braces -
+        # but it also means the panel is not showing stale settings in between.
+        properties.reset_settings(obj.tk_gradient)
         self.report({'INFO'}, "Gradient cancelled")
         return {'FINISHED'}
 

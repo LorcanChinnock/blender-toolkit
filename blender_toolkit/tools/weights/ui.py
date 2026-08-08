@@ -1,5 +1,6 @@
 import bpy
 
+from . import properties
 from .gradient import PATH_SHAPES
 from .operators import (
     TK_OT_add_gradient,
@@ -17,8 +18,12 @@ class TK_PT_weights(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        settings = context.scene.tk_gradient
+        obj = context.active_object
+        if obj is None or obj.type != 'MESH':
+            layout.label(text="Select a mesh", icon='INFO')
+            return
 
+        settings = obj.tk_gradient
         if not settings.active:
             # One entry point. tk.write_gradient is the same thing without a
             # session, kept for scripting rather than shown as a rival button.
@@ -30,15 +35,23 @@ class TK_PT_weights(bpy.types.Panel):
         row.operator(TK_OT_add_gradient.bl_idname, icon='ADD')
         row.operator(TK_OT_cancel_gradient.bl_idname, icon='X')
 
-        obj = context.active_object
         layout.use_property_split = True
         col = layout.column()
-        col.prop(settings, "group_name")
+        # A search field, not a plain text one: picking an existing group is how
+        # you go back and edit one, and typing still names a new group.
+        col.prop_search(
+            settings, "group_name", obj, "vertex_groups", icon='GROUP_VERTEX'
+        )
+        if properties.has_record(obj, settings.group_name):
+            col.label(text="Editing its saved gradient", icon='RECOVER_LAST')
         col.prop_search(settings, "mask_group", obj, "vertex_groups")
 
         col = layout.column()
         col.prop(settings, "shape")
+        col.prop(settings, "snap")
         col.prop(settings, "invert")
+        if settings.shape in PATH_SHAPES:
+            col.prop(settings, "curved")
         col.prop(settings, "smooth_repeat")
 
         col = layout.column()
@@ -51,13 +64,10 @@ class TK_PT_weights(bpy.types.Panel):
             col.prop(settings, "profile")
             col.prop(settings, "midpoint", slider=True)
 
-        col = layout.column()
-        col.prop(settings, "snap")
         if settings.shape in PATH_SHAPES:
-            col.prop(settings, "curved")
             # Handles are placed by dragging them in the viewport, and their
             # number comes from the gradient above - one per stop.
-            col.label(
+            layout.label(
                 text=f"{len(settings.handles)} handles - drag them in the viewport",
                 icon='HANDLETYPE_VECTOR_VEC',
             )

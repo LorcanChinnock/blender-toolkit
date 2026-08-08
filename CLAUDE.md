@@ -113,7 +113,7 @@ These are deliberate. Keep them.
 - **No logic in any `__init__.py`.** They hold `bl_info`, imports, and
   `register()`/`unregister()` loops over a local `classes` tuple. The single
   allowed exception is registration that has to *bracket* the class loop —
-  `tools/weights/__init__.py` assigns and deletes `bpy.types.Scene.tk_gradient`
+  `tools/weights/__init__.py` assigns and deletes `bpy.types.Object.tk_gradient`
   and calls `overlay.disable()`, because a PointerProperty cannot exist before
   its PropertyGroup and a draw handler must not outlive the add-on.
 - **Class naming:** `TK_OT_*` operators, `TK_PT_*` panels, `TK_MT_*` menus,
@@ -190,20 +190,58 @@ old ones are what bpy has registered.
   `Region.tag_redraw` and `UILayout.template_color_ramp` all report `False` and
   all exist. Check `SomeType.bl_rna.functions` instead, or call it on an
   instance. Three separate probes in this repo have been fooled by this.
-- **Nearest-segment lookups need a bound, not a guess.** Taking the KDTree's
-  nearest sample and testing only its own two segments is wrong by up to 0.2 on
-  a path that folds back, and looks perfectly right on a sparse test. The bound
-  that holds: if the nearest point on segment `i` is `d` away, sample `i` is
-  within `d + length(i)`. Sweep `best + longest segment`. Also sort candidates
-  and break ties toward the lowest index, or an exact tie makes the accelerated
-  and brute-force paths disagree.
+- **Per-vertex maths in Python does not scale, and numpy is bundled.** The
+  falloff cost is per vertex *per segment*: 65k verts on a curved eight-handle
+  path was 1.4 s scalar, 163 ms vectorised. A KDTree narrowing the candidate
+  segments needed a careful correctness bound (nearest *sample* is not nearest
+  *segment* — wrong by 0.2 on a path that folds back) and still lost; scanning
+  every segment in numpy is faster *and* exactly right. It was deleted.
+- **Vectorised numeric code must repeat the scalar version's arithmetic in the
+  same order, not merely the same algebra.** `(co - a) - t*d` and
+  `co - (a + t*d)` round differently, and on a path that folds back a vertex can
+  sit exactly equidistant from three segments — so the last bit decides which
+  wins and the two implementations disagree by a whole segment. Keep the scalar
+  version as the tested reference and assert they match on a dense sweep.
+- **Never hand a numpy array to a per-element Python loop.** Iterating one
+  yields numpy scalars, whose arithmetic is an order of magnitude slower than a
+  float's; `.tolist()` on a 65k array was worth most of a second per write.
+- **Drawing is a read-only context.** A `draw_handler`, a panel's `draw()` and
+  `GizmoGroup.refresh()` all raise `AttributeError: Writing to ID classes in
+  this context is not allowed` on any ID write — including a CollectionProperty
+  on the Scene. Anything that has to *watch* something with no update callback
+  (a ColorRamp's `+`/`−` buttons are not even operators) belongs in a
+  `bpy.app.timers` poll, which runs in a writable context. Note a timer has no
+  screen, so `bpy.context.active_object` is `None` there — fall back to
+  `context.view_layer.objects.active`.
+- **`VertexGroup` cannot hold custom properties** — `bpy_struct[key] = val: id
+  properties not supported for this type`. Per-group metadata has to live in a
+  dict on the object keyed by group name, which orphans when the group is
+  renamed outside the add-on.
+- **A live mask must blend against a snapshot, not the current weights.** The
+  session rewrites on every property change; `existing + (target - existing) *
+  influence` read off the mesh feeds its own last result back in, so a
+  half-masked vertex walks towards the full gradient one tweak at a time and the
+  soft edge erodes. Blend against what the session found.
 - Gizmo groups are **not** exposed as `bpy.types.<name>` the way panels are, and
   `bl_rna` survives `unregister_class`. To test registration use
   `bpy.types.GizmoGroup.bl_rna_get_subclass_py("TK_GGT_...")`, which is `None`
   both before registering and after unregistering.
-- Writing weights costs ~30 ms per 65k verts with per-vertex `group.add()`, and
-  the falloff maths ~16 ms. That is fast enough to recompute on every property
-  change. Bucketing by quantised weight was measured at only 2.8× — not worth it.
+- Writing weights costs ~28 ms per 65k verts with per-vertex `group.add()`.
+  Bucketing by quantised weight was measured at only 2.8× — not worth it.
+- **A property `update=` callback must not do the work.** A gizmo drag and a
+  slider drag both fire one per mouse-move event. Set a flag and let the timer
+  coalesce them — and give the commit path an explicit flush, or renaming a
+  group and hitting Add inside one poll commits a group never written.
+- **Weight paint's ramp is a hue sweep, so it is one number.** Blue to red at
+  full saturation passes through cyan, green and yellow — exactly Blender's
+  weight colours — which makes `weight_colour`/`weight_of` an exact inverse pair
+  through the hue. A `ColorRamp` can therefore *be* the weight scale, but only
+  in `color_mode='HSV'` with `hue_interpolation='CCW'`; the default RGB mode
+  runs blue to red through purple, which is no weight at all. Both are
+  user-facing dropdowns on the widget, so both have to be re-enforced on poll.
+- **A `ColorRamp` is capped at 32 elements** — `Unable to add element to
+  colorband (limit 32)`. One handle per stop makes that the handle ceiling too,
+  so the gizmo pool matches it rather than imposing a second limit.
 - `edit_bones` references die on mode switch. Store bone *names* across a
   mode change, not the bones.
 - Bone-name aliases in `PART_ALIASES` are order-sensitive: first match wins, so

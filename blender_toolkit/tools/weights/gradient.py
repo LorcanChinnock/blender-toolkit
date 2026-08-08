@@ -4,7 +4,13 @@ No bpy import: this is the part worth testing directly rather than through an
 operator. Coordinates are object space; callers transform if they need world.
 """
 
+import colorsys
 import math
+
+
+def _clamp(value):
+    return min(max(value, 0.0), 1.0)
+
 
 SHAPES = (
     ('LINEAR', "Path", "Ramp along the path through the handles"),
@@ -16,23 +22,31 @@ SHAPES = (
 # fields defined entirely by the first and last.
 PATH_SHAPES = frozenset({'LINEAR'})
 
-# Handle colours: the low end, the high end, and everything between them.
-LOW_COLOUR = (0.1, 0.4, 1.0, 1.0)
-HIGH_COLOUR = (1.0, 0.6, 0.1, 1.0)
-MID_COLOUR = (0.6, 0.6, 0.6, 1.0)
+# Weight paint's own ramp is a sweep of fully saturated hue from blue to red,
+# through cyan, green and yellow - so the whole thing is one number, the hue,
+# running 2/3 down to 0. Everything the tool shows in a weight colour goes
+# through here, which is why a handle and the mesh under it agree.
+_BLUE_HUE = 2.0 / 3.0
 
 
-def handle_colours(count, invert=False):
-    """Colour per handle, ends swapped when the gradient is inverted.
+def weight_colour(value):
+    """The colour weight paint gives this weight."""
+    hue = (1.0 - _clamp(value)) * _BLUE_HUE
+    return (*colorsys.hsv_to_rgb(hue, 1.0, 1.0), 1.0)
 
-    Shared by the overlay and the gizmos so the two cannot drift apart.
+
+def weight_of(colour):
+    """The weight a colour stands for. The inverse of `weight_colour`.
+
+    Greys have no hue to read, so their brightness is the weight instead. That
+    covers a stop picked out of the colour wheel's grey axis, and it is also what
+    makes ramps saved when this was a greyscale picker still mean what they did.
     """
-    low, high = (HIGH_COLOUR, LOW_COLOUR) if invert else (LOW_COLOUR, HIGH_COLOUR)
-    if count <= 0:
-        return []
-    if count == 1:
-        return [low]
-    return [low] + [MID_COLOUR] * (count - 2) + [high]
+    hue, saturation, brightness = colorsys.rgb_to_hsv(*colour[:3])
+    if saturation < 1e-4:
+        return _clamp(brightness)
+    return _clamp(1.0 - hue / _BLUE_HUE)
+
 
 # Blender's own proportional-edit vocabulary. The curves mirror those falloffs;
 # they are not claimed to be bit-identical to Blender's internals.
@@ -55,10 +69,6 @@ _PROFILE_CURVES = {
     'INVERSE_SQUARE': lambda t: t ** 4,
     'CONSTANT': lambda t: 0.0 if t < 0.5 else 1.0,
 }
-
-
-def _clamp(value):
-    return min(max(value, 0.0), 1.0)
 
 
 def _dot(a, b):
@@ -92,16 +102,29 @@ def _length(a):
     return math.sqrt(_dot(a, a))
 
 
-def path_points(handles, curved=False, per_segment=12):
+# Roughly how many samples a curved path is worth in total. Fidelity comes from
+# control points or from samples between them, so a path with a handle every few
+# centimetres does not need twelve samples in each gap as well - and every sample
+# is a segment tested against every vertex.
+TARGET_SAMPLES = 120
+
+
+def path_points(handles, curved=False, per_segment=None):
     """The polyline the gradient runs along.
 
     Straight is the handles themselves. Curved is a Catmull-Rom sampling, chosen
     because it passes *through* its control points - a handle has to end up
     where you put it.
+
+    `per_segment` defaults to a budget split across the gaps, so the cost of a
+    curved path stops growing with the square of the handle count. Up to eleven
+    handles that works out at the flat 12 it used to be.
     """
     points = [tuple(h) for h in handles]
     if not curved or len(points) < 3:
         return points
+    if per_segment is None:
+        per_segment = max(3, min(12, TARGET_SAMPLES // (len(points) - 1)))
 
     # Duplicate the ends so the first and last segments are drawn too.
     padded = [points[0]] + points + [points[-1]]
@@ -156,13 +179,12 @@ def distance_to_segment(co, a, b):
     return math.sqrt(_project(co, a, b)[1])
 
 
-def path_factor(co, points, metrics=None, lookup=None):
+def path_factor(co, points, metrics=None):
     """Arc-length position of co's nearest point on the polyline, 0..1.
 
-    `metrics` is segment_lengths(points), hoisted out by callers that run this
-    over a whole mesh. `lookup` is an optional callable returning the segment
-    indices worth testing - see properties._lookup_for, which narrows them with
-    a KDTree without ever excluding the true nearest.
+    The scalar reference for `raw_factors`, and what the one-shot operator uses
+    for its two points. `metrics` is segment_lengths(points), hoisted out by
+    callers running this over more than one coordinate.
     """
     if len(points) < 2:
         raise ValueError("A path needs at least two handles")
@@ -170,10 +192,10 @@ def path_factor(co, points, metrics=None, lookup=None):
     if not total:
         raise ValueError("Start and end are the same point")
 
-    # Sorted, and ties keep the first: a path that folds back can put a vertex
-    # exactly equidistant from two segments, and an arbitrary set order would
-    # otherwise pick a different one than a plain scan does.
-    candidates = range(len(lengths)) if lookup is None else sorted(lookup(co))
+    # Ties keep the first: a path that folds back can put a vertex exactly
+    # equidistant from two segments, and the array version resolves it the same
+    # way, so the two cannot disagree.
+    candidates = range(len(lengths))
 
     best_distance_sq = None
     best_arc = 0.0
@@ -185,7 +207,77 @@ def path_factor(co, points, metrics=None, lookup=None):
     return _clamp(best_arc / total)
 
 
-def raw_factor(co, points, shape, metrics=None, lookup=None):
+def raw_factors(coords, points, shape, metrics=None):
+    """`raw_factor` for a whole mesh at once, as a numpy array.
+
+    The scalar version is ~21 microseconds a vertex, which is 1.4 seconds for a
+    65k mesh on a curved eight-handle path - so a handle drag was a slideshow no
+    amount of coalescing could fix. The cost is per vertex *per segment*, and it
+    is all arithmetic, so it vectorises exactly.
+
+    Every segment is tested against every vertex. That is the same work the
+    KDTree used to avoid, except that here it is 84 array operations rather than
+    5.5 million interpreter steps - and it drops the bound the accelerator
+    needed to be careful about, because nothing is being excluded any more.
+
+    numpy is bundled with Blender, so this adds no dependency.
+    """
+    import numpy as np
+
+    coords = np.asarray(coords, dtype=np.float64).reshape(-1, 3)
+    path = np.asarray(points, dtype=np.float64)
+
+    if shape in PATH_SHAPES:
+        lengths, offsets, total = metrics or segment_lengths(points)
+        if len(points) < 2:
+            raise ValueError("A path needs at least two handles")
+        if not total:
+            raise ValueError("Start and end are the same point")
+
+        best_d2 = np.full(len(coords), np.inf)
+        best_arc = np.zeros(len(coords))
+        for index in range(len(path) - 1):
+            a, b = path[index], path[index + 1]
+            direction = b - a
+            length_sq = direction @ direction
+            offset = coords - a
+            if length_sq == 0.0:
+                t = np.zeros(len(coords))
+            else:
+                t = np.clip((offset @ direction) / length_sq, 0.0, 1.0)
+            # Same arithmetic in the same order as _project, not merely the same
+            # algebra: on a path that folds back a vertex can be exactly
+            # equidistant from three segments, and then which one wins is
+            # decided by the last bit. `(co - a) - t*d` and `co - (a + t*d)`
+            # round differently and pick different segments.
+            gap = coords - (a + t[:, None] * direction)
+            d2 = np.einsum('ij,ij->i', gap, gap)
+            # Strictly less, so an exact tie keeps the lower index - the same
+            # rule the scalar scan follows, and one a fold-back path can hit.
+            better = d2 < best_d2
+            best_d2 = np.where(better, d2, best_d2)
+            best_arc = np.where(better, offsets[index] + t * lengths[index], best_arc)
+        return np.clip(best_arc / total, 0.0, 1.0)
+
+    start, end = path[0], path[-1]
+    direction = end - start
+    length_sq = direction @ direction
+    if length_sq == 0.0:
+        raise ValueError("Start and end are the same point")
+
+    offset = coords - start
+    if shape == 'SPHERICAL':
+        return np.clip(
+            np.sqrt(np.einsum('ij,ij->i', offset, offset) / length_sq), 0.0, 1.0
+        )
+    if shape == 'BAND':
+        centre = start + direction * 0.5
+        along = ((coords - centre) @ direction) / length_sq
+        return np.clip(np.abs(along) * 2.0, 0.0, 1.0)
+    raise ValueError(f"Unknown shape: {shape}")
+
+
+def raw_factor(co, points, shape, metrics=None):
     """Position of `co` in the 0..1 field, before the value curve and inversion.
 
     The path shape uses every handle; the radial shapes are defined entirely by
@@ -193,7 +285,7 @@ def raw_factor(co, points, shape, metrics=None, lookup=None):
     bending them.
     """
     if shape in PATH_SHAPES:
-        return path_factor(co, points, metrics, lookup)
+        return path_factor(co, points, metrics)
 
     start, end = points[0], points[-1]
     direction = _sub(end, start)
@@ -211,6 +303,29 @@ def raw_factor(co, points, shape, metrics=None, lookup=None):
     raise ValueError(f"Unknown shape: {shape}")
 
 
+def value(t, profile='LINEAR', midpoint=0.5, invert=False, curve=None):
+    """Weight for a position already resolved to 0..1.
+
+    Split from `raw_factor` because the two halves have very different costs and
+    very different lifetimes. Placing a vertex in the field means a nearest-
+    segment search; mapping that position to a weight is arithmetic. Everything
+    the panel changes except the handles and the shape only touches this half,
+    so callers cache the other one and call this on its own.
+
+    `curve` is an optional callable mapping 0..1 to 0..1, used by the session to
+    read its ColorRamp. Without one the named profile and midpoint apply, which
+    is what the scripting operator uses - an operator property cannot hold a
+    ColorRamp.
+    """
+    if invert:
+        t = 1.0 - t
+    if curve is not None:
+        return _clamp(curve(t))
+    if midpoint != 0.5:
+        t = _remap_midpoint(t, midpoint)
+    return _clamp(_PROFILE_CURVES[profile](t))
+
+
 def factor(
     co,
     points,
@@ -220,23 +335,15 @@ def factor(
     invert=False,
     curve=None,
     metrics=None,
-    lookup=None,
 ):
-    """Weight for one coordinate.
-
-    `curve` is an optional callable mapping 0..1 to 0..1, used by the session to
-    read its ColorRamp. Without one the named profile and midpoint apply, which
-    is what the scripting operator uses - an operator property cannot hold a
-    ColorRamp.
-    """
-    t = raw_factor(co, points, shape, metrics, lookup)
-    if invert:
-        t = 1.0 - t
-    if curve is not None:
-        return _clamp(curve(t))
-    if midpoint != 0.5:
-        t = _remap_midpoint(t, midpoint)
-    return _clamp(_PROFILE_CURVES[profile](t))
+    """Weight for one coordinate. Both halves in one call."""
+    return value(
+        raw_factor(co, points, shape, metrics),
+        profile=profile,
+        midpoint=midpoint,
+        invert=invert,
+        curve=curve,
+    )
 
 
 def smooth(weights, edges, repeat):

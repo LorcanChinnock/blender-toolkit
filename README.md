@@ -119,13 +119,58 @@ tilted plane is just a start and end that aren't axis-aligned.
 
 One button, **Weight Gradient**, opens a live session. It remembers your current
 mode, drops you into Weight Paint, and draws the path in the viewport as
-draggable handles. Every change in the panel rewrites the weights immediately —
-drag a handle, edit the ramp, switch shape — with no re-running and no undo spam.
+draggable handles. Every change in the panel rewrites the weights — drag a
+handle, edit the ramp, switch shape — with no re-running and no undo spam.
+
+Writes are batched rather than done per event: a drag fires an update on every
+mouse-move, so the session collects them and writes at most once every 150 ms.
+On a 65k-vertex mesh, moving a handle rebuilds the falloff in 150–500 ms
+depending on how many handles there are; anything else — the ramp, the profile,
+the mask, the group name — reuses the cached field and costs about 110 ms
+regardless.
 
 | Button | What it does |
 | --- | --- |
 | **Add** | Keeps the current group and stays in the session, so you can rename and add another. A complementary pair is: Add, tick **Invert**, rename, Add. |
 | **Close** | Ends the session, returns you to your original mode. Anything added is kept; the gradient in progress is rolled back, including deleting a group the session created. Next session starts clean. |
+
+**Every session opens clean** — defaults, and a group name nothing is using yet.
+Last round's shape, mask and ramp are not what you want on the next group, so
+none of it carries over. Sessions live on the **object**, so two meshes in a file
+each keep their own.
+
+While a session is running you'll see a `tk.backup.<group>` vertex group for any
+group it borrowed. That's how Close puts the original weights back — it's real
+data rather than something held in memory, so it survives undo and a file save.
+Add and Close both clear it.
+
+Nothing is committed until **Add**. Renaming **Group** mid-session *moves* the
+gradient rather than leaving a copy behind: a group the session created is
+removed under the old name, and one it only borrowed gets its original weights
+back. Only the group named right now carries the gradient.
+
+#### Coming back to a group
+
+**Add** saves the gradient — handles, ramp, shape, mask, everything that decides
+the result — onto the object, keyed by the group's name. It's stored as a custom
+property on the object, so it survives saving the file.
+
+**Group** is a vertex-group search field, so picking an existing group is how you
+go back to one: pick it and its saved gradient loads straight back, ready to
+adjust instead of rebuilt by eye. The panel says **Editing its saved gradient**
+when the group you've picked has one. Typing a name that doesn't exist yet still
+makes a new group, same as before.
+
+The field lists *all* vertex groups rather than only the ones this tool built,
+because pointing a gradient at a group that already exists is useful in itself —
+it overwrites that group and, with **Mask**, blends into it. Picking a group with
+no saved gradient just means there's nothing to load.
+
+The catch: the key is the group's **name**, so renaming the group in Blender's
+own vertex-group list orphans its saved gradient. (`VertexGroup` can't hold
+custom properties at all, so there's nowhere closer to attach it.) Renaming in
+the panel's **Group** field after an Add doesn't rename the committed group
+either — it starts the next one, which is the point of Add.
 
 #### Shapes
 
@@ -145,9 +190,15 @@ between them.
 
 **The gradient decides how many handles exist** — one per stop. Hit `+` on the
 gradient and a handle appears at that spot along the path; remove the stop and
-it goes. Handles are positioned by dragging in the viewport, never by typing
+it goes. The ceiling is **32**, which is Blender's own hard limit on ramp stops
+rather than one this add-on imposes. Handles are positioned by dragging in the viewport, never by typing
 coordinates. Adding a stop in the middle inserts a handle in the middle, and
 handles you've already dragged stay put.
+
+They're coupled in **number, not in position**. Dragging a stop sideways moves
+where its value lands along the path and rewrites the weights; it does not drag
+the handle it was seeded from. The ramp is the value profile, the handles are the
+shape of the path.
 
 Spherical and Band only read the first and last handle, so the panel stops
 offering the ones in between.
@@ -159,23 +210,34 @@ lands on whatever is under the cursor, on the side of the mesh you're looking
 at. (Snapping to the nearest surface in 3D would drop it on the far side as soon
 as you dragged past the surface.)
 
-Handle colours track which end is which and **swap when you invert**, so the warm
-handle is always the high-weight one.
+**Handles are drawn in weight paint's own colour for the weight they sit at** —
+blue at 0, through cyan, green and yellow, to red at 1. A handle and the surface
+under it agree, so inverting or dragging a stop recolours the handles to match
+without needing a legend. They're solid discs rather than rings.
 
 #### Values
 
 The **gradient** maps position along the path to weight. Its `+` / `−` buttons
 add and remove stops, and therefore handles — that native add/remove is why it's
-a colour ramp widget rather than a curve one.
+a colour ramp widget rather than a curve one, and why there is no second handle
+list to keep in step with it.
 
-It's a **value picker, not a colour picker**. Stops are held greyscale and
-opaque: pick a colour and it's flattened to the mean of its RGB, so nothing
-downstream can read a hue as a weight. Alpha is forced to 1 so it can't quietly
-scale the result either.
+It's a **weight picker, not a colour picker**, and it's shown on weight paint's
+own scale: blue → cyan → green → yellow → red. Pick a colour and it snaps to the
+weight colour nearest it, so every colour in the ramp stands for a weight and
+alpha can't quietly scale the result.
+
+That works because weight paint's ramp is a sweep of hue at full saturation —
+one number. The ramp is held in **HSV / Counter-Clockwise**, where two stops
+interpolate through cyan, green and yellow exactly as weight paint does, and the
+weight blends linearly between them. In the ordinary RGB mode blue → red runs
+through purple instead, which is no weight at all; the mode dropdowns are part
+of the widget, so switching them is undone on the next poll.
 
 Blender lets a ramp drop to a single stop; a gradient needs two ends, so the
 floor here is **two** — remove past it and the missing stop reappears at the far
-end.
+end. The ramp has no update callback and its `+` / `−` are not even operators, so
+edits to it are noticed by polling while a session is open.
 
 Turn **Use Gradient** off to fall back to a named **Profile** — Smooth, Sphere,
 Root, Sharp, Inverse Square, Constant — with **Midpoint** sliding where the
@@ -184,7 +246,7 @@ weight crosses 0.5.
 | Option | What it does |
 | --- | --- |
 | **Smooth** | Relaxation passes over the finished weights. |
-| **Mask** | Give it a vertex group and weights are only written where that group has weight. Outside it, existing weights are untouched; a soft mask edge blends old into new. |
+| **Mask** | Give it a vertex group and weights are only written where that group has weight. Outside it, existing weights are untouched; a soft mask edge blends old into new. The protected region is **tinted red in the viewport**, so a low weight there reads as masked rather than as the gradient reaching zero. |
 | **Invert** | Flips the falloff. One run writes one group — for a pair, Add, Invert, rename, Add. |
 
 #### Where the handles start
