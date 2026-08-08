@@ -11,13 +11,15 @@ bl_info = {
 if "bpy" in locals():
     import importlib
 
+    # tools first: ui_pie_menu imports operator classes from it, so reloading
+    # the pie against a stale operators module raises ImportError on any rename.
     importlib.reload(preferences)
-    importlib.reload(ui_pie_menu)
     importlib.reload(tools)
+    importlib.reload(ui_pie_menu)
 else:
     from . import preferences
-    from . import ui_pie_menu
     from . import tools
+    from . import ui_pie_menu
 
 import bpy  # noqa: E402
 
