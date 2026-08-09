@@ -226,6 +226,35 @@ old ones are what bpy has registered.
   `bl_rna` survives `unregister_class`. To test registration use
   `bpy.types.GizmoGroup.bl_rna_get_subclass_py("TK_GGT_...")`, which is `None`
   both before registering and after unregistering.
+- **A gizmo's target handler *is* its location — do not put the position in a
+  matrix as well.** `matrix_basis`, `matrix_offset` and the `"offset"` target
+  compose, so writing the world position into both puts the handle at twice its
+  distance from the origin. Blender's own template says it outright:
+  `scripts/templates_py/Gizmo/operator.py` has `matrix.col[3].xyz = co`
+  commented out under "The location callback handles the location". That
+  templates directory is the reference for anything gizmo-shaped — it is on disk
+  and it is right, which beats reasoning about the C.
+- **`move_3d` leaves a finished drag in `matrix_basis` *and* `matrix_offset`,
+  both of which are added to the target's location.** So a setter that adjusts
+  what it stores — snapping, clamping — leaves the disc where the cursor let go,
+  sliding in the view plane while the data underneath it is the snapped point.
+  Reset both to identity in `draw_prepare`, guarded on `Gizmo.is_modal` or you
+  clear the drag in progress. **Not in `refresh`, which does not run per
+  redraw** — that is why the stale handle only corrected itself when something
+  else forced a refresh, such as dragging a different one.
+- **`Gizmo.use_draw_modal` ("Show while dragging") defaults to False**, so a
+  gizmo is not drawn at all during its own drag. Anything that has to stay
+  visible mid-drag must be drawn by the add-on's own handler —
+  `HANDLE_POINT_SIZE` exists for exactly that.
+- **Snap in the gizmo setter, never in the timer.** `bpy.context.region_data` is
+  only there in the setter's context; without it the snap falls back to
+  nearest-in-3D, which yanks a handle to the far side of the mesh.
+- **`obj.ray_cast` and `obj.closest_point_on_mesh` query *evaluated* geometry** —
+  their docstrings say so — while the polygon index they return is only useful
+  against `obj.data`. With a shape key or a deform modifier the two disagree, and
+  a topology-changing modifier puts the index out of range entirely. Build a
+  `BVHTree.FromPolygons` over the base coordinates instead; it has both
+  `find_nearest` and `ray_cast`, and its indices are base-valid by construction.
 - Writing weights costs ~28 ms per 65k verts with per-vertex `group.add()`.
   Bucketing by quantised weight was measured at only 2.8× — not worth it.
 - **A property `update=` callback must not do the work.** A gizmo drag and a

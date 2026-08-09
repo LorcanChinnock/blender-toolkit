@@ -61,7 +61,7 @@ PROFILES = (
     ('CONSTANT', "Constant", "0 below the midpoint, 1 above"),
 )
 
-_PROFILE_CURVES = {
+PROFILE_CURVES = {
     'LINEAR': lambda t: t,
     'SMOOTH': lambda t: t * t * (3.0 - 2.0 * t),
     'SPHERE': lambda t: math.sqrt(max(1.0 - (1.0 - t) ** 2, 0.0)),
@@ -199,13 +199,18 @@ def handle_arc_positions(points, count, curved=False, per_segment=None):
     ]
 
 
-def weight_curve(knots):
-    """Piecewise-linear mapping through `(position, weight)` pairs, or None.
+def weight_curve(knots, ease=None):
+    """Mapping through `(position, weight)` pairs, or None.
 
     What the ramp's stops mean once their position is the weight rather than a
     place along the path: the pairs come from the handles, one knot each.
     Outside the first and last knot the curve holds flat - a handle is a control
     point, not a boundary, and the path runs past both ends of it.
+
+    `ease` shapes the travel between one knot and the next, straight through the
+    profile curves. It is applied to the local 0..1 within a span rather than to
+    the result, so every knot still reads back exactly the weight it was given -
+    which is the whole premise of a stop being a weight.
     """
     knots = sorted(knots)
     if not knots:
@@ -225,6 +230,8 @@ def weight_curve(knots):
         if span <= 0.0:  # two handles at the same place along the path
             return weights[index + 1]
         local = (t - positions[index]) / span
+        if ease is not None:
+            local = _clamp(ease(local))
         return weights[index] + (weights[index + 1] - weights[index]) * local
 
     return curve
@@ -241,10 +248,6 @@ def _project(co, a, b):
     closest = _add(a, _scale(direction, t))
     offset = _sub(co, closest)
     return t, _dot(offset, offset)
-
-
-def distance_to_segment(co, a, b):
-    return math.sqrt(_project(co, a, b)[1])
 
 
 # How close a second segment has to be, as a fraction of the path's length,
@@ -427,7 +430,7 @@ def value(t, profile='LINEAR', midpoint=0.5, invert=False, curve=None):
     else:
         if midpoint != 0.5:
             t = _remap_midpoint(t, midpoint)
-        result = _clamp(_PROFILE_CURVES[profile](t))
+        result = _clamp(PROFILE_CURVES[profile](t))
     return 1.0 - result if invert else result
 
 

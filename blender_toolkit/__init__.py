@@ -4,13 +4,12 @@ bl_info = {
     "version": (1, 0, 0),
     "blender": (5, 2, 0),
     "location": "View3D > Sidebar > Toolkit, Shift+Alt+Q",
-    "description": "Retopology, shapekey, rigging and export tools for game-ready assets",
+    "description": "Retopology, shapekey, weight, rigging and export tools for "
+                   "game-ready assets",
     "category": "3D View",
 }
 
 import importlib
-
-import bpy
 
 from . import utils
 

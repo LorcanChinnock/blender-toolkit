@@ -21,6 +21,7 @@ _mask_cache = (None, None)
 # The ramp as it was last seen, so an edit to it can be noticed at all.
 _signature = None
 
+
 # A fixed pool of gizmos, hidden down to the handle count, so the gizmo
 # collection is never mutated at runtime. 32 because that is Blender's own hard
 # ceiling on ColorRamp elements - "Unable to add element to colorband (limit
@@ -29,6 +30,12 @@ _signature = None
 MAX_HANDLES = 32
 
 LINE_COLOUR = (1.0, 1.0, 1.0, 0.6)
+
+# The dot drawn at every handle, in pixels. It has to read as the handle on its
+# own: Gizmo.use_draw_modal defaults to False, so the gizmo's own disc is not
+# drawn at all while it is being dragged, and this is the only marker left.
+# Sized to sit roughly where the disc was rather than as a pinprick inside it.
+HANDLE_POINT_SIZE = 18.0
 
 # Fast enough that clicking + on the ramp feels immediate, slow enough that the
 # poll is free.
@@ -185,7 +192,7 @@ def _draw():
         return
 
     gpu.state.depth_test_set('NONE')
-    gpu.state.point_size_set(12.0)
+    gpu.state.point_size_set(HANDLE_POINT_SIZE)
 
     shader.bind()
     if lines:
@@ -245,10 +252,17 @@ def _sync():
 
 @persistent
 def _on_depsgraph(scene, depsgraph):
-    """Rebuild the mask tint when the mesh changes under it - but not when the
-    change is our own write, which would rebuild it several times a second."""
-    if not properties.writing():
-        invalidate_mask()
+    """Drop what the mesh changing invalidates - but not on our own writes,
+    which would rebuild several times a second."""
+    if properties.writing():
+        return
+    invalidate_mask()
+    # Only when the geometry itself moved. A handle position is a property on
+    # the object, and writing one still fires this handler - so invalidating
+    # unconditionally rebuilt the snap tree once per mouse-move event, measured
+    # at 31 ms per 40k verts, inside the very drag the timer exists to coalesce.
+    if any(update.is_updated_geometry for update in depsgraph.updates):
+        snapping.invalidate()
 
 
 def invalidate_mask():
@@ -297,10 +311,13 @@ def _handle_accessors(index):
         if settings is None or index >= len(settings.handles):
             return
         local = obj.matrix_world.inverted() @ Vector(value)
-        # Snap as the handle moves rather than on release, so what you see
-        # during the drag is what you get. region_data lets it aim down the
-        # view ray and land on what the cursor is over, rather than on whatever
-        # happens to be nearest in 3D.
+        # Snapped here rather than on release, so the handle lands on the
+        # geometry as it moves and the path redraws through where it will
+        # actually end up. The gizmo reads its own position back through get(),
+        # so it follows the snap rather than the raw cursor.
+        #
+        # region_data is what lets the snap aim down the view ray - it is the
+        # cursor's direction, and only this context has it. A timer does not.
         settings.handles[index].position = snapping.snap(
             obj, local, settings.snap, bpy.context.region_data
         )
@@ -338,9 +355,23 @@ class TK_GGT_weight_gradient(bpy.types.GizmoGroup):
             get, set = _handle_accessors(index)
             gizmo.target_set_handler("offset", get=get, set=set)
             self.handle_gizmos.append(gizmo)
-        self.refresh(context)
+        self.draw_prepare(context)
 
-    def refresh(self, context):
+    def draw_prepare(self, context):
+        """Hold every gizmo to the handles, once per redraw.
+
+        Both `matrix_basis` and `matrix_offset` are *added* to the location the
+        target handler reports, and move_3d leaves its finished drag in them. So
+        a handle that snapped stays drawn where the cursor let go - sliding in
+        the view plane, never landing on the surface - while the path underneath
+        it is rebuilt from the snapped point. Identity on both is what makes the
+        target the only thing deciding where a handle is drawn.
+
+        All of it here rather than in `refresh`, which does not run per redraw:
+        that is why the stale one only used to correct itself when something
+        *else* forced a refresh, like dragging a different handle. Skipped while
+        a gizmo is modal, because then the matrix is the drag in progress.
+        """
         obj = context.active_object
         if obj is None:
             return
@@ -350,13 +381,11 @@ class TK_GGT_weight_gradient(bpy.types.GizmoGroup):
         colours = properties.handle_colours(settings)
         for index, gizmo in enumerate(self.handle_gizmos):
             gizmo.hide = index >= count
-            if gizmo.hide:
+            if gizmo.hide or gizmo.is_modal:
                 continue
             gizmo.color = colours[index][:3]
-            # Identity, not obj.matrix_world: the target below is already in
-            # world space, so anything else here transforms it twice - which
-            # only looks right while the object sits at the origin.
             gizmo.matrix_basis = Matrix.Identity(4)
+            gizmo.matrix_offset.identity()
 
 
 classes = (TK_GGT_weight_gradient,)

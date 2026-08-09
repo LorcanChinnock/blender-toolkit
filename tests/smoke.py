@@ -481,6 +481,52 @@ def test_snapping():
     assert tuple(snapping.snap(bpy.context.active_object, outside, 'VERTEX')) == outside
 
 
+def test_snapping_uses_base_geometry():
+    """Every mode lands on the base cage, whatever the evaluated mesh looks like.
+
+    `ray_cast` and `closest_point_on_mesh` query evaluated geometry, so indexing
+    `obj.data` with the polygon they return put FACE on the deformed surface and
+    VERTEX/EDGE on the base one - and raised outright once a modifier changed
+    the topology.
+    """
+    from blender_toolkit.tools.weights import snapping
+
+    reset()
+    obj = _grid_with_key(subdivisions=4)
+    obj.active_shape_key.value = 1.0  # the evaluated surface a metre above base
+    obj.modifiers.new("Sub", 'SUBSURF').levels = 2  # base 16 polygons, evaluated 256
+    bpy.context.view_layer.update()
+
+    probe = Vector((0.3, 0.3, 0.0))
+    for mode in ('FACE', 'VERTEX', 'EDGE'):
+        got = snapping.snap(obj, probe, mode)
+        assert abs(got.z) < 1e-6, (mode, tuple(got))  # the flat base, not z = 1
+
+    # The cache keys on topology alone, so moving vertices needs an explicit
+    # drop - which is what the depsgraph handler fires on a real mesh edit.
+    for vert in obj.data.vertices:
+        vert.co.x += 10.0
+    snapping.invalidate()
+    assert snapping.snap(obj, Vector((10.3, 0.3, 0.0)), 'VERTEX').x > 9.0
+
+    # A depsgraph update that did not touch geometry must leave the tree alone.
+    # Writing a handle position fires the handler once per mouse-move event, and
+    # rebuilding there costs ~31 ms per 40k verts inside the drag.
+    from types import SimpleNamespace
+
+    from blender_toolkit.tools.weights import overlay
+
+    built = snapping._tree_cache[0]
+    overlay._on_depsgraph(None, SimpleNamespace(
+        updates=[SimpleNamespace(is_updated_geometry=False)]
+    ))
+    assert snapping._tree_cache[0] == built, "kept when only a property changed"
+    overlay._on_depsgraph(None, SimpleNamespace(
+        updates=[SimpleNamespace(is_updated_geometry=True)]
+    ))
+    assert snapping._tree_cache[0] is None, "dropped when the mesh really moved"
+
+
 def test_snapping_follows_the_cursor():
     """Snap to what the view ray hits, not to whatever is nearest in 3D.
 
@@ -572,7 +618,6 @@ def test_handles_follow_ramp_stops():
         stops.remove(stops[1])
     assert properties.sync_handles_to_ramp(settings) is True
     assert len(settings.handles) == 2
-    assert settings.active_handle < len(settings.handles)
 
     bpy.ops.tk.cancel_gradient()
 
@@ -601,6 +646,41 @@ def test_ramp_edits_are_noticed():
     group = obj.vertex_groups[settings.group_name]
     low = min(obj.data.vertices, key=lambda v: v.co.x)
     assert abs(group.weight(low.index) - 0.25) < 1e-5, group.weight(low.index)
+    bpy.ops.tk.cancel_gradient()
+
+
+def test_handle_setter_snaps_live():
+    """The gizmo's setter snaps as it writes, so a drag lands on the geometry.
+
+    The gizmo reads its position back through the getter, so what it draws is
+    the snapped point rather than the raw cursor - which is what keeps the disc
+    and the path the same point mid-drag.
+    """
+    from blender_toolkit.tools.weights import overlay
+
+    reset()
+    obj = _grid_with_key()
+    settings = obj.tk_gradient
+    assert bpy.ops.tk.start_gradient(source='BOUNDS', axis='X') == {'FINISHED'}
+    get, set = overlay._handle_accessors(0)
+
+    settings.snap = 'FREE'
+    set((0.3, 0.3, 5.0))
+    assert Vector(get()) == Vector((0.3, 0.3, 5.0)), "FREE stores it untouched"
+
+    settings.snap = 'VERTEX'
+    set((0.3, 0.3, 5.0))
+    landed = Vector(get())
+    assert landed.z == 0.0 and any(
+        (v.co - landed).length < 1e-6 for v in obj.data.vertices
+    ), tuple(landed)
+    # What the gizmo draws and what the path is built from are one value.
+    assert Vector(settings.handles[0].position) == landed
+
+    # A gizmo past the end of the handles must not raise.
+    overlay._handle_accessors(99)[1]((0.0, 0.0, 0.0))
+    assert overlay._handle_accessors(99)[0]() == [0.0, 0.0, 0.0]
+
     bpy.ops.tk.cancel_gradient()
 
 
@@ -726,6 +806,15 @@ def test_weight_curve():
     assert gradient.weight_curve([]) is None
     assert gradient.weight_curve([(0.3, 0.4)])(0.9) == 0.4
 
+    # The profile shapes the travel between two knots, never the knots
+    # themselves - a handle has to keep reading exactly what its stop says.
+    eased = gradient.weight_curve(
+        [(0.0, 0.0), (0.5, 0.9), (1.0, 1.0)], ease=gradient.PROFILE_CURVES['SHARP']
+    )
+    assert eased(0.0) == 0.0 and abs(eased(0.5) - 0.9) < 1e-9 and eased(1.0) == 1.0
+    assert eased(0.25) < curve(0.25), "SHARP starts slower than linear"
+    assert abs(eased(0.25) - 0.9 * 0.25) < 1e-9  # local 0.5, squared
+
 
 def test_ramp_values():
     """The curve is built from the handles, not read off the ramp."""
@@ -771,9 +860,6 @@ def test_ramp_values():
         flipped = gradient.factor(co, path, curve=curve, invert=True)
         assert abs(straight + flipped - 1.0) < 1e-6, co
 
-    settings.use_ramp = False
-    assert properties.ramp_curve(settings) is None  # falls back to the profile
-    settings.use_ramp = True
     bpy.ops.tk.cancel_gradient()
 
 
@@ -884,30 +970,36 @@ def test_gradient_session():
     assert obj.mode == 'OBJECT'
     assert created not in obj.vertex_groups  # Cancel removes what it created
 
-    # Add keeps the weights and leaves the session running for the next group.
+    # Add keeps the weights and moves on to the next group by itself: no
+    # renaming step to know about, and the next one starts from defaults.
     assert bpy.ops.tk.start_gradient(source='BOUNDS', axis='Y') == {'FINISHED'}
+    first = settings.group_name
     kept = weights()
+    span = [tuple(h.position) for h in settings.handles]
     assert bpy.ops.tk.add_gradient() == {'FINISHED'}
     assert settings.active, "Add must not end the session"
     assert obj.mode == 'WEIGHT_PAINT'
-    assert weights() == kept
+    assert [
+        obj.vertex_groups[first].weight(v.index) for v in obj.data.vertices
+    ] == kept
+    assert settings.group_name != first, "Add advances to the next group"
+    assert settings.group_name not in obj.vertex_groups
+    assert settings.invert is False, "the next gradient starts from defaults"
+    assert [tuple(h.position) for h in settings.handles] == span, "path stays put"
+    assert settings.added_names == first
 
-    # A second group without leaving: rename, invert, Add again.
-    first = settings.group_name
+    # A second group without leaving, inverted so the pair adds to 1. Finish
+    # keeps it and closes, where Cancel would have thrown it away.
     settings.group_name = "Second"
     settings.invert = True
-    assert bpy.ops.tk.add_gradient() == {'FINISHED'}
+    assert bpy.ops.tk.finish_gradient() == {'FINISHED'}
+    assert not settings.active
+    assert obj.mode == 'OBJECT'
     assert {first, "Second"} <= {g.name for g in obj.vertex_groups}
     for vert in obj.data.vertices:
         a = obj.vertex_groups[first].weight(vert.index)
         b = obj.vertex_groups["Second"].weight(vert.index)
         assert abs(a + b - 1.0) < 1e-5, (a, b)
-
-    # Closing afterwards keeps everything that was added.
-    assert bpy.ops.tk.cancel_gradient() == {'FINISHED'}
-    assert obj.mode == 'OBJECT'
-    assert not settings.active
-    assert {first, "Second"} <= {g.name for g in obj.vertex_groups}
 
 
 def test_session_backup_round_trips_membership():
@@ -1159,6 +1251,41 @@ def test_gradient_mask_edge_does_not_erode():
         settings.invert = False
         flush(obj)
     assert all(abs(a - b) < 1e-6 for a, b in zip(first, weights()))
+
+    bpy.ops.tk.cancel_gradient()
+
+
+def test_distribute_evenly_and_reset_for_next():
+    """The button that replaces the old ramp toggle, and what Add keeps."""
+    from blender_toolkit.tools.weights import properties
+
+    reset()
+    obj = _grid_with_key()
+    settings = obj.tk_gradient
+    assert bpy.ops.tk.start_gradient(source='BOUNDS', axis='X') == {'FINISHED'}
+
+    ramp = properties.ramp_of(settings)
+    for position in (0.2, 0.3, 0.4):
+        ramp.elements.new(position)
+    properties.sync_handles_to_ramp(settings)
+    assert len(settings.handles) == 5
+
+    # Even either way round: the stored weights are raw, and Invert only moves
+    # the stops to where those weights now read on the bar.
+    even = [0.0, 0.25, 0.5, 0.75, 1.0]
+    for settings.invert in (False, True):
+        assert bpy.ops.tk.distribute_handle_weights() == {'FINISHED'}
+        assert [round(h.weight, 6) for h in settings.handles] == even
+        assert [round(e.position, 6) for e in ramp.elements] == even
+
+    # Add keeps the ends of the path and drops everything else back to default.
+    ends = [tuple(settings.handles[i].position) for i in (0, -1)]
+    settings.smooth_repeat = 3
+    assert bpy.ops.tk.add_gradient() == {'FINISHED'}
+    assert [tuple(h.position) for h in settings.handles] == ends
+    assert [h.weight for h in settings.handles] == [0.0, 1.0]
+    assert settings.smooth_repeat == 0 and settings.invert is False
+    assert len(properties.ramp_of(settings).elements) == 2
 
     bpy.ops.tk.cancel_gradient()
 

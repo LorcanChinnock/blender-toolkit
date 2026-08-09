@@ -131,20 +131,23 @@ regardless.
 
 | Button | What it does |
 | --- | --- |
-| **Add** | Keeps the current group and stays in the session, so you can rename and add another. A complementary pair is: Add, tick **Invert**, rename, Add. |
-| **Close** | Ends the session, returns you to your original mode. Anything added is kept; the gradient in progress is rolled back, including deleting a group the session created. Next session starts clean. |
+| **Add** | Keeps the current group and moves straight on to the next one: the gradient resets to defaults and the name advances to one nothing is using. The path stays where you dragged it — its two ends, at least, since the ramp goes back to two stops. |
+| **Finish** | Keeps the current group and ends the session, back to your original mode. |
+| **Cancel** | Ends the session and throws away the gradient in progress, including deleting a group the session created. Anything you already hit Add or Finish on is kept. |
 
 **Every session opens clean** — defaults, and a group name nothing is using yet.
 Last round's shape, mask and ramp are not what you want on the next group, so
-none of it carries over. Sessions live on the **object**, so two meshes in a file
-each keep their own.
+none of it carries over. **Add** opens clean the same way, minus the handles:
+the next group almost always runs over the same span, and re-placing the path is
+the part that took the work. Sessions live on the **object**, so two meshes in a
+file each keep their own.
 
 While a session is running you'll see a `tk.backup.<group>` vertex group for any
-group it borrowed. That's how Close puts the original weights back — it's real
+group it borrowed. That's how Cancel puts the original weights back — it's real
 data rather than something held in memory, so it survives undo and a file save.
-Add and Close both clear it.
+Add and Finish both clear it.
 
-Nothing is committed until **Add**. Renaming **Group** mid-session *moves* the
+Nothing is committed until **Add** or **Finish**. Renaming **Group** mid-session *moves* the
 gradient rather than leaving a copy behind: a group the session created is
 removed under the old name, and one it only borrowed gets its original weights
 back. Only the group named right now carries the gradient.
@@ -250,24 +253,26 @@ renders as the true scale. In the ordinary RGB mode blue → red runs through
 purple instead, which is no weight at all; the mode dropdowns are part of the
 widget, so switching them is undone too.
 
-The weight *between* handles is a straight line from one to the next, so the
-profile is as many segments as you have handles. Past the outermost handle it
-holds flat — a handle is a control point, not a boundary.
+**Profile** decides how the weight travels *between* one handle and the next —
+Linear, Smooth, Sphere, Root, Sharp, Inverse Square, Constant. It shapes the
+segments, never the handles: a handle always reads back exactly the weight its
+stop shows. Past the outermost handle the weight holds flat — a handle is a
+control point, not a boundary.
+
+**Distribute Evenly** spaces the stops out from one end of the scale to the
+other, which is the plain even run you'd get from a gradient you never touched.
+It's the way back after hand-editing the stops.
 
 Blender lets a ramp drop to a single stop; a gradient needs two ends, so the
 floor here is **two** — remove past it and the missing stop reappears at the far
 end. The ramp has no update callback and its `+` / `−` are not even operators, so
 edits to it are noticed by polling while a session is open.
 
-Turn **Use Gradient** off to fall back to a named **Profile** — Smooth, Sphere,
-Root, Sharp, Inverse Square, Constant — with **Midpoint** sliding where the
-weight crosses 0.5.
-
 | Option | What it does |
 | --- | --- |
 | **Smooth** | Relaxation passes over the finished weights. |
 | **Mask** | Give it a vertex group and weights are only written where that group has weight. Outside it, existing weights are untouched; a soft mask edge blends old into new. The protected region is **tinted red in the viewport**, so a low weight there reads as masked rather than as the gradient reaching zero. |
-| **Invert** | Negates every weight, and moves the stops to where those weights now read on the bar. A gradient and its inverse add up to **exactly 1** at every vertex, so the pair is genuinely complementary — Add, Invert, rename, Add. |
+| **Invert** | Negates every weight, and moves the stops to where those weights now read on the bar. A gradient and its inverse add up to **exactly 1** at every vertex, so the pair is genuinely complementary — Add, tick Invert, Finish. |
 
 #### Where the handles start
 

@@ -1,10 +1,24 @@
 """Landing gradient handles on mesh geometry.
 
-One BVH query via closest_point_on_mesh, then a refinement inside the single
-polygon it returns - so the cost does not grow with the mesh.
+One BVH query, then a refinement inside the single polygon it returns - so the
+cost does not grow with the mesh.
+
+The tree is built over the *base* mesh, never over `obj.ray_cast` /
+`obj.closest_point_on_mesh`. Those two query evaluated geometry - their own
+docstrings say so - while the polygon index they return is then used to index
+`obj.data`. With a shape key or a deform modifier active that lands FACE on the
+deformed surface and VERTEX/EDGE on the base cage, so the modes disagree; with a
+topology-changing modifier the index is out of range outright and the lookup
+raises. Base coordinates are also what the gradient measures and what the path
+is drawn in, so this is the surface the handle belongs on.
 """
 
 from mathutils import Vector
+from mathutils.bvhtree import BVHTree
+
+# One tree per (object, topology), because rebuilding it per mouse-move event
+# would undo the drag coalescing everything else here is careful about.
+_tree_cache = (None, None)
 
 MODES = (
     ('FREE', "Free", "Drag in the view plane, ignoring the surface"),
@@ -47,17 +61,40 @@ def _view_ray(obj, point, region_data):
     return to_local @ origin, (to_local.to_3x3() @ direction).normalized()
 
 
+def _base_tree(obj):
+    """A BVH over the base mesh, cached until its topology changes."""
+    global _tree_cache
+    mesh = obj.data
+    key = (obj.name, len(mesh.vertices), len(mesh.polygons))
+    if key != _tree_cache[0]:
+        _tree_cache = (
+            key,
+            BVHTree.FromPolygons(
+                [v.co[:] for v in mesh.vertices],
+                [tuple(p.vertices) for p in mesh.polygons],
+            ),
+        )
+    return _tree_cache[1]
+
+
+def invalidate():
+    """Drop the cached tree - vertices moved without the counts changing."""
+    global _tree_cache
+    _tree_cache = (None, None)
+
+
 def _surface_point(obj, point, region_data):
     """Where on the surface to snap to, and which polygon it landed in."""
+    tree = _base_tree(obj)
     if region_data is not None:
         origin, direction = _view_ray(obj, point, region_data)
-        hit, location, _normal, index = obj.ray_cast(origin, direction)
-        if hit:
+        location, _normal, index, _distance = tree.ray_cast(origin, direction)
+        if location is not None:
             return location, index
 
     # No viewport to aim through, or the ray missed the mesh entirely.
-    hit, location, _normal, index = obj.closest_point_on_mesh(point)
-    return (location, index) if hit else (None, None)
+    location, _normal, index, _distance = tree.find_nearest(point)
+    return (location, index) if location is not None else (None, None)
 
 
 def snap(obj, point, mode, region_data=None):
@@ -68,7 +105,7 @@ def snap(obj, point, mode, region_data=None):
     nothing was hit would be worse than one that does not snap.
     """
     point = Vector(point)
-    if mode == 'FREE' or obj is None or obj.type != 'MESH':
+    if mode == 'FREE' or obj is None or obj.type != 'MESH' or not obj.data.polygons:
         return point
 
     location, index = _surface_point(obj, point, region_data)

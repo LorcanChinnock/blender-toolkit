@@ -114,11 +114,20 @@ def ramp_curve(settings, points=None):
     Not read off the ramp any more. A stop's position is its handle's weight, so
     the curve is a knot per handle: where it sits along the path, and what it
     weighs. The ramp is where the weight is *edited*, not where it is stored.
+
+    The profile rides along as the easing between one knot and the next, which
+    is the only place left for it to mean anything: the handles decide the
+    weights, so all that is left to choose is how the weight travels between
+    them.
     """
-    if not settings.use_ramp or len(settings.handles) < MIN_STOPS:
+    if len(settings.handles) < MIN_STOPS:
         return None
+    # None for Linear rather than the identity lambda: weight_curve skips the
+    # call entirely, and it is one per vertex on the default profile.
+    profile = settings.profile
     return gradient.weight_curve(
-        zip(handle_arcs(settings, points), (h.weight for h in settings.handles))
+        zip(handle_arcs(settings, points), (h.weight for h in settings.handles)),
+        ease=None if profile == 'LINEAR' else gradient.PROFILE_CURVES[profile],
     )
 
 
@@ -193,23 +202,11 @@ def mirror_weights_to_ramp(settings):
 def handle_values(settings):
     """The weight the gradient produces at each handle.
 
-    With the gradient on, that is the handle's own weight as the bar shows it -
-    the stop it owns sits at exactly that place on the scale. With it off, the
-    named profile decides, read at where the handle sits along the path. Either
-    way this is what the mesh reads there, which is what lets a handle be drawn
-    in the colour the surface under it will be.
+    The handle's own weight as the bar shows it - the stop it owns sits at
+    exactly that place on the scale. This is what the mesh reads there, which is
+    what lets a handle be drawn in the colour the surface under it will be.
     """
-    if settings.use_ramp:
-        return [flip(settings, h.weight) for h in settings.handles]
-    return [
-        gradient.value(
-            arc,
-            profile=settings.profile,
-            midpoint=settings.midpoint,
-            invert=settings.invert,
-        )
-        for arc in handle_arcs(settings)
-    ]
+    return [flip(settings, h.weight) for h in settings.handles]
 
 
 def handle_colours(settings):
@@ -288,7 +285,6 @@ def sync_handles_to_ramp(settings):
         handle = settings.handles.add()
         handle.weight = flip(settings, stop)
         handle.position = position
-    settings.active_handle = min(settings.active_handle, len(settings.handles) - 1)
     return True
 
 
@@ -388,11 +384,15 @@ def write_weights(context, settings, points=None, curve=None):
     except ValueError:  # handles coincident mid-drag; keep the last good weights
         return
 
+    # A curve wins over both of these, and the session settings do not carry a
+    # midpoint at all - it is the scripting operator, which cannot hold a
+    # ColorRamp, that still needs one.
+    midpoint = getattr(settings, "midpoint", 0.5)
     weights = {
         index: gradient.value(
             t,
             profile=settings.profile,
-            midpoint=settings.midpoint,
+            midpoint=midpoint,
             invert=settings.invert,
             curve=curve,
         )
@@ -449,8 +449,7 @@ RECORD_KEY = "tk_gradient"
 # Everything that decides what the gradient produces. Snap is left out: it is
 # how a handle is placed, not part of the result.
 RECORDED = (
-    "shape", "profile", "midpoint", "invert", "smooth_repeat", "curved",
-    "use_ramp", "mask_group",
+    "shape", "profile", "invert", "smooth_repeat", "curved", "mask_group",
 )
 
 
@@ -466,6 +465,43 @@ def reset_settings(settings):
         if prop.identifier not in _KEEP_ON_RESET:
             settings.property_unset(prop.identifier)
     reset_ramp(settings)
+
+
+def spread_weights(settings):
+    """Weights evenly from one end of the scale to the other, in path order.
+
+    Stored raw, not flipped: Invert negates on the way out, so writing it this
+    way is what keeps an inverted gradient running the other way.
+    """
+    last = max(len(settings.handles) - 1, 1)
+    for index, handle in enumerate(settings.handles):
+        handle.weight = index / last
+
+
+def set_handles(settings, points):
+    """Replace the path with the given points, weights spread evenly."""
+    settings.handles.clear()
+    for point in points:
+        settings.handles.add().position = point
+    spread_weights(settings)
+
+
+def reset_for_next(settings):
+    """Between two groups in one session: a fresh gradient over the same path.
+
+    Not reset_settings, which clears the handles too. Placing the path is the
+    part that took the work and the next group almost always runs over the same
+    span, so the positions survive - but the ramp goes back to two stops, and
+    the handle count follows the ramp, so the ends are what is kept.
+
+    RECORDED is exactly the right list: what a record stores is what decides the
+    result, which is what the next group must not inherit.
+    """
+    for name in RECORDED:
+        settings.property_unset(name)
+    reset_ramp(settings)
+    if settings.handles:
+        set_handles(settings, [tuple(settings.handles[i].position) for i in (0, -1)])
 
 
 def unused_group_name(obj, base="Group"):
@@ -530,7 +566,6 @@ def load_record(obj, settings, name):
             handle = settings.handles.add()
             handle.weight = weight
             handle.position = entry[-3:]
-        settings.active_handle = 0
 
         ensure_ramp(settings)
         ramp = ramp_of(settings)
@@ -677,10 +712,14 @@ class TK_PG_weight_gradient(bpy.types.PropertyGroup):
         name="Shape", items=gradient.SHAPES, default='LINEAR', update=_rewrite
     )
     profile: bpy.props.EnumProperty(
-        name="Profile", items=gradient.PROFILES, default='LINEAR', update=_rewrite
+        name="Profile",
+        description="How the weight travels from one handle to the next. The "
+        "handles themselves always read exactly what their stops say",
+        items=gradient.PROFILES,
+        default='LINEAR',
+        update=_rewrite,
     )
     handles: bpy.props.CollectionProperty(type=TK_PG_gradient_handle)
-    active_handle: bpy.props.IntProperty(name="Handle", default=0, min=0)
     curved: bpy.props.BoolProperty(
         name="Curved",
         description="Bend the path smoothly through the handles instead of "
@@ -695,22 +734,6 @@ class TK_PG_weight_gradient(bpy.types.PropertyGroup):
         default='FREE',
     )
     ramp: bpy.props.PointerProperty(type=bpy.types.Texture)
-    use_ramp: bpy.props.BoolProperty(
-        name="Use Gradient",
-        description="Map position along the path to weight with the gradient. "
-        "Its stops are held greyscale - this picks a value, not a colour",
-        default=True,
-        update=_rewrite,
-    )
-    midpoint: bpy.props.FloatProperty(
-        name="Midpoint",
-        description="Where along the gradient the weight passes 0.5",
-        default=0.5,
-        min=0.0,
-        max=1.0,
-        subtype='FACTOR',
-        update=_rewrite,
-    )
     invert: bpy.props.BoolProperty(
         name="Invert",
         description="Negate every weight, so a gradient and its inverse add up "
@@ -742,6 +765,9 @@ class TK_PG_weight_gradient(bpy.types.PropertyGroup):
 
     active: bpy.props.BoolProperty(default=False)
     previous_mode: bpy.props.StringProperty(default='OBJECT')
+    # What this session has committed so far, so the panel can say. A joined
+    # string rather than a collection: it is only ever shown, never indexed.
+    added_names: bpy.props.StringProperty(default="")
 
 
 classes = (TK_PG_gradient_handle, TK_PG_weight_gradient)
