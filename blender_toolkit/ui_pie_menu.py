@@ -7,11 +7,8 @@ from .tools.shapekeys.operators import (
     TK_OT_apply_modifiers_shapekeys,
     TK_OT_split_shapekey,
 )
-from .tools.weights.operators import (
-    TK_OT_add_gradient,
-    TK_OT_finish_gradient,
-    TK_OT_start_gradient,
-)
+from .tools.weights.operators import TK_OT_add_gradient, TK_OT_distribute_handles
+from .tools.weights.properties import active_gradient
 from .utils import prefs
 
 
@@ -32,12 +29,12 @@ class TK_MT_pie_main(bpy.types.Menu):
             pie.operator(TK_OT_apply_modifiers_shapekeys.bl_idname, icon='MODIFIER')
             pie.operator(TK_OT_split_shapekey.bl_idname, icon='MOD_MIRROR')
         elif context.mode == 'PAINT_WEIGHT' and settings.use_weights:
-            obj = context.active_object
-            if obj is not None and obj.tk_gradient.active:
-                pie.operator(TK_OT_add_gradient.bl_idname, icon='ADD')
-                pie.operator(TK_OT_finish_gradient.bl_idname, icon='CHECKMARK')
+            pie.operator(TK_OT_add_gradient.bl_idname, icon='ADD')
+            if active_gradient(context.active_object) is not None:
+                pie.operator(
+                    TK_OT_distribute_handles.bl_idname, icon='ARROW_LEFTRIGHT'
+                ).mode = 'WEIGHTS'
             else:
-                pie.operator(TK_OT_start_gradient.bl_idname, icon='MOD_VERTEX_WEIGHT')
                 pie.separator()
         elif context.mode in {'POSE', 'EDIT_ARMATURE'} and settings.use_rigging:
             pie.operator(TK_OT_validate_humanoid.bl_idname, icon='ARMATURE_DATA')

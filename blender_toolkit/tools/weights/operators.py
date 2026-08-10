@@ -3,7 +3,7 @@ import bpy
 from mathutils import Vector
 
 from ...utils import ensure_mode
-from . import gradient, overlay, properties
+from . import gradient, properties
 
 
 def _selection_points(context, obj):
@@ -77,7 +77,7 @@ def _seed_points(operator, context, obj):
 
 
 class _SourceMixin:
-    """Where the two points come from, shared by the one-shot and Start."""
+    """Where the two points come from, shared by the one-shot and Add."""
 
     source: bpy.props.EnumProperty(
         name="Points From",
@@ -105,9 +105,10 @@ class _SourceMixin:
 
 
 class TK_OT_write_gradient(_SourceMixin, bpy.types.Operator):
-    """Write a spatial gradient into a vertex group in one shot, no session
+    """Write a spatial gradient into a vertex group in one shot
 
-    The scripting entry point. The panel offers tk.start_gradient instead.
+    The scripting entry point: no gradient is kept afterwards, so there is
+    nothing to go back and adjust. The panel offers tk.add_gradient instead.
     """
 
     bl_idname = "tk.write_gradient"
@@ -165,202 +166,175 @@ class TK_OT_write_gradient(_SourceMixin, bpy.types.Operator):
             return {'CANCELLED'}
 
         with ensure_mode(context, 'OBJECT'):
+            # A masked write blends towards what the group already held, and
+            # that has to be read before the write, not after. Nothing here
+            # outlives the call, so it is read straight into the argument.
+            baseline = (
+                properties.read_weights(obj, self.group_name)
+                if self.mask_group else None
+            )
             properties.write_weights(
-                context, self, points=[tuple(self.start), tuple(self.end)]
+                context, self, points=[tuple(self.start), tuple(self.end)],
+                baseline=baseline,
             )
 
         self.report({'INFO'}, f"Wrote gradient into '{self.group_name}'")
         return {'FINISHED'}
 
 
-class _SessionMixin:
-    """Only meaningful while a session is running on the active object."""
+class _ActiveMixin:
+    """Only meaningful when a gradient on the active object is selected."""
+
+    @classmethod
+    def poll(cls, context):
+        return properties.active_gradient(context.active_object) is not None
+
+
+class TK_OT_add_gradient(_SourceMixin, bpy.types.Operator):
+    """Generate this vertex group's weights from a gradient, replacing them
+
+    Adds a gradient to the active vertex group, or to a new group when there is
+    none. A gradient is an attribute of a group, so the group's own list is
+    where you pick which one you are editing - there is no second list.
+
+    The new gradient starts as a copy of the last one added: the reason for a
+    second is nearly always the first again with one thing changed.
+    """
+
+    bl_idname = "tk.add_gradient"
+    bl_label = "Add Gradient"
+    bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
         obj = context.active_object
-        return obj is not None and obj.type == 'MESH' and obj.tk_gradient.active
-
-
-class TK_OT_start_gradient(_SourceMixin, bpy.types.Operator):
-    """Build vertex group weights from a spatial gradient, adjusted live
-
-    Drops into weight paint with draggable handles. Add keeps a group and moves
-    on to the next, Finish keeps it and closes, Cancel throws it away.
-    """
-
-    bl_idname = "tk.start_gradient"
-    bl_label = "Weight Gradient"
-    bl_options = {'REGISTER', 'UNDO'}
+        if obj is None or obj.type != 'MESH':
+            return False
+        # One gradient per group, by construction: with one already on the
+        # active group the panel shows its settings instead of this button.
+        return properties.active_gradient(obj) is None
 
     def execute(self, context):
         obj = context.active_object
-        settings = context.active_object.tk_gradient
+        properties.purge_orphans(obj)
 
-        # Every session opens clean: last round's shape, mask and ramp are not
-        # what you want on the next group, and neither is its name. Pick a group
-        # from the panel to edit one that already exists - that loads its saved
-        # gradient - rather than inheriting whatever was left over.
-        properties.reset_settings(settings)
-        settings.group_name = properties.unused_group_name(obj)
+        active = obj.vertex_groups.active
+        if active is not None and active.lock_weight:
+            # Reported rather than silently doing nothing: putting a generator
+            # on a group declared untouchable is a contradiction, not a no-op.
+            self.report({'ERROR'}, f"'{active.name}' is locked")
+            return {'CANCELLED'}
 
         seeded, error, origin = _seed_points(self, context, obj)
         if error:
             self.report({'ERROR'}, error)
             return {'CANCELLED'}
+
+        source = obj.tk_gradients[-1] if len(obj.tk_gradients) else None
+        entry = obj.tk_gradients.add()
+        if source is not None:
+            properties.copy_gradient(source, entry)
+        else:
+            properties.ensure_ramp(entry)
+
         if seeded is not None:
-            properties.set_handles(settings, seeded)
-        if len(settings.handles) < 2:
+            properties.set_handles(entry, seeded)
+        if len(entry.handles) < 2:
+            obj.tk_gradients.remove(len(obj.tk_gradients) - 1)
             self.report({'ERROR'}, "The gradient needs at least two handles")
             return {'CANCELLED'}
-        if Vector(settings.handles[0].position) == Vector(settings.handles[-1].position):
+        if Vector(entry.handles[0].position) == Vector(entry.handles[-1].position):
+            obj.tk_gradients.remove(len(obj.tk_gradients) - 1)
             self.report({'ERROR'}, "Start and end are the same point")
             return {'CANCELLED'}
 
-        properties.ensure_ramp(settings)
-        settings.previous_mode = obj.mode
+        active = obj.vertex_groups.active
+        entry.group_name = (
+            active.name if active is not None
+            else properties.unused_group_name(obj)
+        )
+        entry.name = entry.group_name
 
-        if obj.mode != 'WEIGHT_PAINT':
+        # Weight paint is where the weights it writes are visible, so being
+        # dropped there is what you wanted. It does not switch back - there is
+        # no session to come out of.
+        if context.mode != 'PAINT_WEIGHT' and bpy.ops.object.mode_set.poll():
             bpy.ops.object.mode_set(mode='WEIGHT_PAINT')
-        settings.active = True
-        properties.write_weights(context, settings)  # snapshots as it goes
-        if settings.group_name in obj.vertex_groups:
-            obj.vertex_groups.active = obj.vertex_groups[settings.group_name]
-        overlay.enable()
 
-        # Say which it used: with AUTO, "selection" vs "X bounds" is the
-        # difference between what you picked and a sensible default.
-        self.report({'INFO'}, f"Gradient session started from {origin}")
+        properties.flush(context, entry)
+        if entry.group_name in obj.vertex_groups:
+            obj.vertex_groups.active = obj.vertex_groups[entry.group_name]
+
+        self.report({'INFO'}, f"Gradient into '{entry.group_name}' from {origin}")
         return {'FINISHED'}
 
 
-def _end_session(context, obj):
-    settings = obj.tk_gradient
-    settings.active = False
-    overlay.disable()
-    if obj.mode != settings.previous_mode:
-        bpy.ops.object.mode_set(mode=settings.previous_mode)
+class TK_OT_distribute_handles(_ActiveMixin, bpy.types.Operator):
+    """Even out the handles - what they weigh, or where they sit
 
-
-class _CommitMixin(_SessionMixin):
-    """Committing the gradient in progress, shared by Add and Finish."""
-
-    @classmethod
-    def poll(cls, context):
-        return super().poll(context) and bool(
-            context.active_object.tk_gradient.group_name
-        )
-
-    def commit(self, context, obj):
-        """Make the current group permanent. Returns the name it was kept as."""
-        settings = obj.tk_gradient
-        # Anything still pending has to land before it is committed: writes are
-        # deferred to the session timer, and a commit can arrive inside that
-        # window.
-        properties.flush(context, settings)
-
-        # Committing means dropping the way back: from here on Cancel has
-        # nothing to take back for the groups written so far.
-        name = settings.group_name
-        properties.save_record(obj, settings, name)
-        properties.forget(obj)
-        settings.added_names = ", ".join(
-            filter(None, (settings.added_names, name))
-        )
-        return name
-
-
-class TK_OT_add_gradient(_CommitMixin, bpy.types.Operator):
-    """Keep this group and move on to the next one
-
-    The gradient resets to defaults and the name moves on to one nothing is
-    using, so the next group starts clean. The path stays where you dragged it -
-    the ends of it, at least, since the ramp goes back to two stops.
+    Weights and positions are independent: one says what value each handle
+    reaches, the other where along the path it sits. Hand-dragged handles bunch
+    up in both.
     """
 
-    bl_idname = "tk.add_gradient"
-    bl_label = "Add"
+    bl_idname = "tk.distribute_handles"
+    bl_label = "Distribute Handles"
     bl_options = {'REGISTER', 'UNDO'}
 
-    def execute(self, context):
-        obj = context.active_object
-        settings = obj.tk_gradient
-        name = self.commit(context, obj)
+    mode: bpy.props.EnumProperty(
+        name="Mode",
+        items=[
+            ('WEIGHTS', "Weights",
+             "Space the handles' weights evenly along the path. Undoes any "
+             "hand-editing of the stops, back to a plain even run"),
+            ('POSITIONS', "Space",
+             "Respace the handles at equal arc length along the path, ends "
+             "pinned"),
+            ('RELAX', "Relax",
+             "Pull each handle towards the midpoint of its neighbours, ends "
+             "pinned. Straightens kinks; repeat for more"),
+        ],
+        default='WEIGHTS',
+    )
+    factor: bpy.props.FloatProperty(
+        name="Factor",
+        description="How far a handle moves towards its neighbours' midpoint",
+        default=0.5, min=0.0, max=1.0, subtype='FACTOR',
+    )
+    repeat: bpy.props.IntProperty(
+        name="Repeat", description="Relaxation passes", default=1, min=1, max=50
+    )
 
-        # Reset before renaming: the rename is what starts writing the next
-        # group, and it should write the fresh gradient rather than this one's.
-        properties.reset_for_next(settings)
-        settings.group_name = properties.unused_group_name(obj)
-
-        self.report({'INFO'}, f"Kept '{name}' - now editing '{settings.group_name}'")
-        return {'FINISHED'}
-
-
-class TK_OT_finish_gradient(_CommitMixin, bpy.types.Operator):
-    """Keep this group and close the session
-
-    Everything added stays. Returns you to the mode you were in.
-    """
-
-    bl_idname = "tk.finish_gradient"
-    bl_label = "Finish"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        obj = context.active_object
-        name = self.commit(context, obj)
-        _end_session(context, obj)
-        properties.reset_settings(obj.tk_gradient)
-        self.report({'INFO'}, f"Kept '{name}' and closed the session")
-        return {'FINISHED'}
-
-
-class TK_OT_cancel_gradient(_SessionMixin, bpy.types.Operator):
-    """Close the session, throwing away the gradient in progress
-
-    Groups you already hit Add or Finish on are kept; only the one being edited
-    right now is rolled back, including deleting a group the session created.
-    """
-
-    bl_idname = "tk.cancel_gradient"
-    bl_label = "Cancel"
-    bl_options = {'REGISTER', 'UNDO'}
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.prop(self, "mode")
+        if self.mode == 'RELAX':
+            layout.prop(self, "factor")
+            layout.prop(self, "repeat")
 
     def execute(self, context):
-        obj = context.active_object
-        properties.restore(obj)
-        _end_session(context, obj)
-        # Cancel leaves no trace. Start resets too, so this is belt and braces -
-        # but it also means the panel is not showing stale settings in between.
-        properties.reset_settings(obj.tk_gradient)
-        self.report({'INFO'}, "Gradient cancelled")
-        return {'FINISHED'}
-
-
-class TK_OT_distribute_handle_weights(_SessionMixin, bpy.types.Operator):
-    """Space the handles' weights evenly along the path
-
-    Undoes any hand-editing of the stops, back to a plain even run. Invert still
-    applies, so an inverted gradient comes back running the other way.
-    """
-
-    bl_idname = "tk.distribute_handle_weights"
-    bl_label = "Distribute Evenly"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        settings = context.active_object.tk_gradient
-        properties.spread_weights(settings)
-        properties.mirror_weights_to_ramp(settings)
+        settings = properties.active_gradient(context.active_object)
+        if self.mode == 'WEIGHTS':
+            properties.spread_weights(settings)
+            properties.mirror_weights_to_ramp(settings)
+        else:
+            handles = [tuple(h.position) for h in settings.handles]
+            moved = (
+                gradient.spaced_positions(handles, settings.curved)
+                if self.mode == 'POSITIONS'
+                else gradient.relax_positions(handles, self.factor, self.repeat)
+            )
+            # Assigned in place rather than through set_handles, which respreads
+            # the weights - the whole point here is to move one and not the other.
+            for handle, position in zip(settings.handles, moved):
+                handle.position = position
         properties.mark_dirty()
         return {'FINISHED'}
 
 
 classes = (
     TK_OT_write_gradient,
-    TK_OT_start_gradient,
     TK_OT_add_gradient,
-    TK_OT_finish_gradient,
-    TK_OT_cancel_gradient,
-    TK_OT_distribute_handle_weights,
+    TK_OT_distribute_handles,
 )

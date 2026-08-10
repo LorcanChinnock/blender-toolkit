@@ -1,21 +1,29 @@
 import bpy
 from mathutils import Vector
 
-from . import gradient, snapping
+from . import gradient
 
 RAMP_NAME = "TK Weight Gradient"
 
-# What the session has touched and how to put it back, recorded as real data on
-# the object rather than in a module dict. A dict does not survive undo, a file
-# save, a Reload Scripts or the object being renamed - and every one of those
-# leaves Cancel restoring weights that no longer correspond to the mesh.
+# What a group held before a gradient adopted it, kept as an ID property array
+# on the gradient itself - a real datablock write, so it survives undo, a save
+# and a Reload Scripts the way a module-level dict never could.
 #
-# Two halves, because "the group had no members" and "there was no group" have
-# to be told apart: SESSION_KEY names what was touched and whether the session
-# created it, and a borrowed group's weights are copied into a backup group,
-# whose membership mirrors the original exactly.
-SESSION_KEY = "tk_gradient_session"
-BACKUP_PREFIX = "tk.backup."
+# It used to be a `tk.backup.<group>` vertex group, which worked but put a junk
+# row in the user's own vertex group list, in every modifier's group dropdown
+# and in the export - none of which the add-on can filter. On the gradient it is
+# invisible, it dies with the gradient, and it needs no name to be tracked
+# through a rename.
+BASELINE_KEY = "baseline"
+
+# The weights the gradient last wrote, so a hand-painted stroke can be told from
+# any other reason the mesh updated.
+WRITTEN_KEY = "written"
+
+# Weights are 0..1, so a negative one is free to mean "this vertex was not in
+# the group at all" - which has to round-trip as itself rather than as zero, or
+# restoring makes every vertex a member weighing nothing.
+NOT_A_MEMBER = -1.0
 
 # Blender's own floor is one stop; a gradient needs two ends to run between.
 MIN_STOPS = 2
@@ -35,6 +43,11 @@ _dirty = False
 # True while write_weights is running, so the depsgraph updates it causes are not
 # mistaken for the user editing the mesh.
 _writing = False
+
+# True while a gradient is being pointed at a group it has just been renamed
+# into, so the rename callback - which exists to *move* a gradient - stays out
+# of the way.
+_healing = False
 
 
 def ensure_ramp(settings):
@@ -183,20 +196,28 @@ def stops_in_handle_order(settings, stops):
 
 
 def mirror_weights_to_ramp(settings):
-    """Move the stops to where the handles' weights now read on the bar.
+    """Move the stops to where the handles' weights now read on the bar. True
+    when any of them had to move.
 
-    Nothing else writes stop positions - the bar is an input, not an output -
-    except when what a weight *means* changes underneath it, which is exactly
-    what Invert does.
+    The bar is usually the input and the handles the output. Two things push the
+    other way: Invert, which changes what a stored weight *means* without
+    touching it, and a weight typed straight into the handle list.
     """
     ramp = ramp_of(settings)
     if ramp is None or not settings.handles:
-        return
+        return False
     shown = sorted(flip(settings, h.weight) for h in settings.handles)
     elements = sorted(ramp.elements, key=lambda e: e.position)
+    if len(elements) != len(shown):
+        return False
+
+    changed = False
     for element, weight in zip(elements, shown):
-        element.position = weight
-        element.color = gradient.weight_colour(weight)
+        if abs(element.position - weight) > 1e-6:
+            element.position = weight
+            element.color = gradient.weight_colour(weight)
+            changed = True
+    return changed
 
 
 def handle_values(settings):
@@ -254,7 +275,9 @@ def sync_handles_to_ramp(settings):
 
     stops = stops_in_handle_order(settings, sorted(e.position for e in ramp.elements))
     if len(stops) == len(settings.handles):
-        # Where the user's drag landed. Nothing else writes these.
+        # Where the user's drag landed. Nothing else writes these - the bar is
+        # the one weight editor, which is why there is no second list of the
+        # same numbers to keep in step with it.
         for handle, stop in zip(settings.handles, stops):
             handle.weight = flip(settings, stop)
         return False
@@ -337,6 +360,11 @@ def _mark_dirty(self, context):
     mark_dirty()
 
 
+def pending():
+    """Is a write already queued? Then nothing else needs to look for changes."""
+    return _dirty
+
+
 def take_dirty():
     global _dirty
     was, _dirty = _dirty, False
@@ -359,7 +387,7 @@ def writing():
     return _writing
 
 
-def write_weights(context, settings, points=None, curve=None):
+def write_weights(context, settings, points=None, curve=None, baseline=None):
     """Recompute and write both groups. Called live from every setting's update.
 
     `points` and `curve` are passed in rather than read off `settings`: the
@@ -405,66 +433,102 @@ def write_weights(context, settings, points=None, curve=None):
         )
 
     name = settings.group_name
-    if not name or name.startswith(BACKUP_PREFIX):
+    if not name:
         return
-    snapshot(obj, name)  # before the first write to this group, not before all
-    group = obj.vertex_groups.get(name) or obj.vertex_groups.new(name=name)
+    group = obj.vertex_groups.get(name)
+    if group is None:
+        group = obj.vertex_groups.new(name=name)
+        # Remembered so removing the gradient can take the group with it. A
+        # group that was already there is the user's, and stays.
+        if hasattr(settings, "created_group"):
+            settings.created_group = True
+    elif group.lock_weight:
+        # `lock_weight` stops Blender's paint tools, not the API - group.add()
+        # writes straight through it - so a live gradient has to check it or the
+        # lock means nothing against the one thing writing every 150 ms.
+        return
     # Weight paint draws the active group, so the one being written is the one
     # that should be on screen - including straight after a rename.
     obj.vertex_groups.active = group
 
     mask = obj.vertex_groups.get(settings.mask_group) if settings.mask_group else None
-    # What the mask blends towards is the group as the session found it, never
-    # as it stands: the session rewrites on every property change, and blending
-    # against its own last result walks a half-masked vertex towards the full
-    # gradient one tweak at a time until the soft edge has eroded away.
-    baseline = baseline_of(obj, name) if mask is not None else None
+    # What the blend composes with, and what the mask blends *towards*, is the
+    # group as the gradient first found it - never as it stands. The gradient
+    # rewrites on every property change, and reading its own last result back in
+    # walks a half-masked vertex towards the full gradient one tweak at a time
+    # until the soft edge has eroded away.
+    #
+    # The one-shot operator passes its own and carries no stored one - an
+    # Operator raises "this type doesn't support IDProperties" if asked.
+    if baseline is None and hasattr(settings, "created_group"):
+        baseline = baseline_of(settings, len(mesh.vertices))
+    mode = getattr(settings, "blend", 'REPLACE')
     per_vertex = _memberships(obj) if mask is not None else None
 
+    written = [0.0] * len(mesh.vertices)
     global _writing
     _writing = True
     try:
         for index, weight in weights.items():
-            value = weight
+            existing = 0.0 if baseline is None else max(baseline[index], 0.0)
+            value = weight if mode == 'REPLACE' else gradient.blend(
+                mode, existing, weight
+            )
             if mask is not None:
-                # Outside the mask the pre-session weight stands, so a region can
-                # be protected; a soft mask edge blends old and new.
+                # Outside the mask what the group already held stands, so a
+                # region can be protected; a soft edge blends old into new.
                 influence = per_vertex[index].get(mask.index, 0.0)
-                existing = 0.0 if baseline is None else (baseline[index] or 0.0)
                 value = existing + (value - existing) * influence
             # ponytail: per-vertex add, measured 28ms/65k verts - about half of
             # what a cached rewrite now costs. Worth revisiting with
             # foreach_set only if that half starts to matter.
             group.add([index], value, 'REPLACE')
+            written[index] = value
     finally:
         _writing = False
 
+    # What the group should read if nobody else has touched it. Painting on it
+    # is what detaches the gradient, and this is how that is told apart from a
+    # posed armature or a shape key slider, both of which also update the mesh.
+    if hasattr(settings, "created_group"):
+        settings[WRITTEN_KEY] = written
 
-# Saved gradients live on the object, keyed by group name. A VertexGroup cannot
-# hold custom properties at all - "id properties not supported for this type" -
-# so there is nowhere closer to put them. The cost of that is a group renamed in
-# Blender's own list leaves its record behind under the old name.
-RECORD_KEY = "tk_gradient"
 
-# Everything that decides what the gradient produces. Snap is left out: it is
-# how a handle is placed, not part of the result.
-RECORDED = (
+# Everything that decides what a gradient produces, which is exactly what a new
+# gradient copies from the one it was made from. The target group is not in it -
+# two gradients writing one group would fight - and neither is the path, which
+# is copied separately because it is a collection rather than a value.
+COPIED = (
     "shape", "profile", "invert", "smooth_repeat", "curved", "mask_group",
+    "blend",
 )
 
 
-# Not reset with the rest: the ramp is a datablock the settings only point at,
-# and the two session-state flags are what the caller is in the middle of
-# setting. reset_settings clears the ramp's stops instead of dropping it.
-_KEEP_ON_RESET = {"rna_type", "name", "ramp", "active", "previous_mode"}
+def copy_gradient(source, target):
+    """Everything but the target group: a new gradient starts as a variation.
 
+    The reason for a second gradient is nearly always the first one again with
+    one thing changed - inverted, masked, aimed at a different group - so
+    starting from a copy is fewer clicks than rebuilding it, and Reset is one
+    button away.
+    """
+    for name in COPIED:
+        setattr(target, name, getattr(source, name))
+    set_handles(target, [tuple(h.position) for h in source.handles])
+    for handle, original in zip(target.handles, source.handles):
+        handle.weight = original.weight
 
-def reset_settings(settings):
-    """Back to defaults. A session never inherits the last one's settings."""
-    for prop in settings.bl_rna.properties:
-        if prop.identifier not in _KEEP_ON_RESET:
-            settings.property_unset(prop.identifier)
-    reset_ramp(settings)
+    ensure_ramp(target)
+    ramp, original = ramp_of(target), ramp_of(source)
+    while len(ramp.elements) > MIN_STOPS:
+        ramp.elements.remove(ramp.elements[1])
+    for index, stop in enumerate(sorted(e.position for e in original.elements)):
+        element = (
+            ramp.elements[index] if index < len(ramp.elements)
+            else ramp.elements.new(stop)
+        )
+        element.position = stop
+        element.color = gradient.weight_colour(stop)
 
 
 def spread_weights(settings):
@@ -486,24 +550,6 @@ def set_handles(settings, points):
     spread_weights(settings)
 
 
-def reset_for_next(settings):
-    """Between two groups in one session: a fresh gradient over the same path.
-
-    Not reset_settings, which clears the handles too. Placing the path is the
-    part that took the work and the next group almost always runs over the same
-    span, so the positions survive - but the ramp goes back to two stops, and
-    the handle count follows the ramp, so the ends are what is kept.
-
-    RECORDED is exactly the right list: what a record stores is what decides the
-    result, which is what the next group must not inherit.
-    """
-    for name in RECORDED:
-        settings.property_unset(name)
-    reset_ramp(settings)
-    if settings.handles:
-        set_handles(settings, [tuple(settings.handles[i].position) for i in (0, -1)])
-
-
 def unused_group_name(obj, base="Group"):
     """A group name nothing is using yet, numbered Blender's way."""
     if base not in obj.vertex_groups:
@@ -514,75 +560,144 @@ def unused_group_name(obj, base="Group"):
     return f"{base}.{index:03d}"
 
 
-def has_record(obj, name):
-    return name in (obj.get(RECORD_KEY) or {})
+def gradients_of(obj):
+    """Every gradient on `obj`, or an empty tuple for a non-mesh."""
+    return getattr(obj, "tk_gradients", ())
 
 
-def save_record(obj, settings, name):
-    """Remember how this group was built, so it can be picked up again later."""
-    ramp = ramp_of(settings)
-    records = {
-        key: dict(value) for key, value in (obj.get(RECORD_KEY) or {}).items()
-    }
-    records[name] = {
-        **{key: getattr(settings, key) for key in RECORDED},
-        # Weight first, then the object-space position. The stops are not stored
-        # separately any more - a stop is just a handle's weight.
-        "handles": [[h.weight, *h.position] for h in settings.handles],
-    }
-    obj[RECORD_KEY] = records
+def gradient_for(obj, name):
+    """The gradient writing vertex group `name`, or None.
+
+    Looked up by name because a gradient is an *attribute of a vertex group*,
+    not a thing with its own list. There was a second list here once, shadowing
+    Blender's own, and nothing said which one was the master.
+    """
+    return next(
+        (entry for entry in gradients_of(obj) if entry.group_name == name), None
+    )
 
 
-def load_record(obj, settings, name):
-    """Restore a saved gradient onto the settings. True when there was one."""
-    record = (obj.get(RECORD_KEY) or {}).get(name)
-    if record is None:
+def active_gradient(obj):
+    """The gradient on the active vertex group, or None.
+
+    Selecting a vertex group *is* selecting a gradient. The two were already
+    coupled - write_weights makes the group it writes the active one - so this
+    only stops pretending they were separate.
+    """
+    groups = getattr(obj, "vertex_groups", None)
+    active = groups.active if groups is not None else None
+    return gradient_for(obj, active.name) if active is not None else None
+
+
+def remember_groups(obj):
+    """Snapshot where each gradient's group sits, for `purge_orphans` to use.
+
+    Taken after every purge rather than before, so what is stored is always the
+    arrangement as it stood the last time everything still lined up.
+    """
+    count = len(obj.vertex_groups)
+    for entry in obj.tk_gradients:
+        group = obj.vertex_groups.get(entry.group_name)
+        if group is not None:
+            entry.group_index = group.index
+            entry.group_count = count
+
+
+def _heal_rename(obj, entry):
+    """Follow a gradient's group through a rename in Blender's own list. True
+    when it was followed.
+
+    Blender gives add-ons no rename hook, so a rename can only be *inferred*.
+    The evidence: the name is gone, the number of groups has not changed since
+    the last look, and the group still sitting at the remembered index has no
+    gradient of its own. Deleting a group changes the count, so that falls
+    through to a purge instead of adopting whichever group shuffled into place.
+    """
+    global _healing
+    if entry.group_count != len(obj.vertex_groups):
+        return False
+    if not 0 <= entry.group_index < len(obj.vertex_groups):
+        return False
+    group = obj.vertex_groups[entry.group_index]
+    if gradient_for(obj, group.name) is not None:
         return False
 
-    # Deactivated across the load: every one of these properties rewrites the
-    # weights on change, and a restore would otherwise cost a dozen full passes
-    # to arrive where one at the end gets it.
-    was_active = settings.active
-    settings.active = False
+    # Straight across, with the rename callback held off: that callback exists
+    # to *move* a gradient to another group, which is the opposite of following
+    # one that has moved by itself.
+    _healing = True
     try:
-        for key in RECORDED:
-            setattr(settings, key, record[key])
-
-        # Three shapes have been written. A leading float is a weight now, but
-        # in the version before this it was the stop position along the path,
-        # and the weights lived in a separate "stops" list.
-        entries = [list(e) for e in record["handles"]]
-        stops = [list(s) for s in record.get("stops", [])]
-        if len(entries[0]) == 4 and stops:
-            weights = [value for _position, value in stops]
-        elif len(entries[0]) == 4:
-            weights = [entry[0] for entry in entries]
-        else:  # no weight was stored at all; spread them evenly
-            last = max(len(entries) - 1, 1)
-            weights = [index / last for index in range(len(entries))]
-
-        settings.handles.clear()
-        for entry, weight in zip(entries, weights):
-            handle = settings.handles.add()
-            handle.weight = weight
-            handle.position = entry[-3:]
-
-        ensure_ramp(settings)
-        ramp = ramp_of(settings)
-        # One at a time, re-fetched: removing invalidates the others.
-        while len(ramp.elements) > MIN_STOPS:
-            ramp.elements.remove(ramp.elements[1])
-        shown = sorted(flip(settings, weight) for weight in weights)
-        for index, weight in enumerate(shown):
-            element = (
-                ramp.elements[index] if index < len(ramp.elements)
-                else ramp.elements.new(weight)
-            )
-            element.position = weight
-            element.color = gradient.weight_colour(weight)
+        entry.group_name = group.name
+        entry.name = group.name
+        entry.previous_group = group.name
     finally:
-        settings.active = was_active
+        _healing = False
     return True
+
+
+def purge_orphans(obj):
+    """Reunite or drop gradients whose vertex group name is gone. True on either.
+
+    A plain rename is followed. Anything else - the group deleted, groups
+    reordered - drops the gradient rather than guessing, which keeps the tool
+    self-cleaning instead of letting invisible state pile up in the file. Ctrl+Z
+    brings it straight back.
+
+    A write, so never from `draw`: the operators and the overlay timer call it.
+    """
+    names = {group.name for group in obj.vertex_groups}
+    changed = False
+    for index in reversed(range(len(obj.tk_gradients))):
+        entry = obj.tk_gradients[index]
+        if entry.group_name in names:
+            continue
+        changed = True
+        if not _heal_rename(obj, entry):
+            discard(obj, index)
+
+    remember_groups(obj)
+    return changed
+
+
+def discard(obj, index):
+    """Drop a gradient, leaving its vertex group and weights exactly as they are.
+
+    The only exit there is. Nothing here deletes a vertex group: the weights are
+    the work, and a gradient letting go of them is not a reason to lose them.
+    """
+    entry = obj.tk_gradients[index]
+    name = entry.group_name
+
+    # Cleared before the datablock goes, or the pointer is left dangling.
+    ramp, entry.ramp = entry.ramp, None
+    if ramp is not None and ramp.users == 0:
+        bpy.data.textures.remove(ramp)
+
+    obj.tk_gradients.remove(index)
+    return name
+
+
+def index_of(obj, settings):
+    """Where `settings` sits in the object's gradients."""
+    return next(
+        index
+        for index, entry in enumerate(obj.tk_gradients)
+        if entry == settings
+    )
+
+
+def showing(obj):
+    """Is there a gradient whose path should be drawn on this object?
+
+    Selecting a vertex group that has a gradient is the whole of the intent -
+    there was a Show Handles toggle here once and it meant nothing, because
+    nobody opens a gradient's panel in order not to see it.
+    """
+    return bool(
+        obj is not None
+        and obj.type == 'MESH'
+        and active_gradient(obj) is not None
+    )
 
 
 def _memberships(obj):
@@ -590,73 +705,73 @@ def _memberships(obj):
     return [{g.group: g.weight for g in v.groups} for v in obj.data.vertices]
 
 
-def snapshot(obj, name):
-    """Remember a group before this session first overwrites it.
-
-    Recorded per group and lazily, because a session writes several in a row:
-    rename, adjust, Add, repeat.
-
-    A borrowed group's weights go into a backup group whose membership mirrors
-    the original, so "not a member" round-trips as itself rather than as zero.
-    A group the session had to create is only named, with nothing to back up.
-    """
-    session = dict(obj.get(SESSION_KEY) or {})
-    if name in session:
-        return
-
+def read_weights(obj, name):
+    """Every vertex's weight in `name`, `NOT_A_MEMBER` where it has none."""
     group = obj.vertex_groups.get(name)
-    session[name] = "borrowed" if group else "created"
-    obj[SESSION_KEY] = session
     if group is None:
-        return
-
-    backup = obj.vertex_groups.new(name=BACKUP_PREFIX + name)
-    for index, weights in enumerate(_memberships(obj)):
-        if group.index in weights:
-            backup.add([index], weights[group.index], 'REPLACE')
-
-
-def restore(obj):
-    """Put the mesh back exactly as snapshot() found it."""
-    session = obj.get(SESSION_KEY)
-    if session is None:
-        return
-
-    for name, origin in dict(session).items():
-        group = obj.vertex_groups.get(name)
-        backup = obj.vertex_groups.get(BACKUP_PREFIX + name)
-        if group is not None and origin == "created":
-            obj.vertex_groups.remove(group)
-        elif group is not None and backup is not None:
-            saved = [v.get(backup.index) for v in _memberships(obj)]
-            for index, weight in enumerate(saved):
-                if weight is None:  # vertex was not a member before
-                    group.remove([index])
-                else:
-                    group.add([index], weight, 'REPLACE')
-        if backup is not None:
-            obj.vertex_groups.remove(backup)
-    del obj[SESSION_KEY]
-
-
-def forget(obj):
-    """Commit: the session's writes stand, so the way back is dropped."""
-    session = obj.get(SESSION_KEY)
-    if session is None:
-        return
-    for name in dict(session):
-        backup = obj.vertex_groups.get(BACKUP_PREFIX + name)
-        if backup is not None:
-            obj.vertex_groups.remove(backup)
-    del obj[SESSION_KEY]
-
-
-def baseline_of(obj, name):
-    """Pre-session weights of `name`, or None when the session created it."""
-    backup = obj.vertex_groups.get(BACKUP_PREFIX + name)
-    if backup is None:
         return None
-    return [v.get(backup.index) for v in _memberships(obj)]
+    return [
+        weights.get(group.index, NOT_A_MEMBER) for weights in _memberships(obj)
+    ]
+
+
+def capture_baseline(settings, obj):
+    """Remember what the group held before this gradient adopted it, once.
+
+    Two readers, and neither is a commit log. A mask blends *towards* this:
+    outside the mask the weights the user already had must stand, and they
+    cannot be read off the group once the gradient has started overwriting it.
+    Remove hands the same weights back, which is what makes Remove and Apply a
+    symmetric pair - undo the adoption, or keep the result.
+    """
+    if BASELINE_KEY in settings:
+        return
+    saved = read_weights(obj, settings.group_name)
+    if saved is not None:
+        settings[BASELINE_KEY] = saved
+
+
+def drop_baseline(settings):
+    """The gradient let the group go, so there is no 'before' any more."""
+    if BASELINE_KEY in settings:
+        del settings[BASELINE_KEY]
+
+
+def baseline_of(settings, count):
+    """The stored baseline, or None when there is none that still fits.
+
+    A mesh whose vertex count has changed since the capture invalidates it
+    outright - the array is positional and there is nothing to map it through.
+    """
+    saved = settings.get(BASELINE_KEY)
+    return saved if saved is not None and len(saved) == count else None
+
+
+def hand_painted(obj, settings):
+    """Has something other than the gradient changed its group's weights?
+
+    Exact rather than inferred: the depsgraph says the mesh updated, but a posed
+    armature, a shape key slider and a modifier tweak all say the same thing.
+    Comparing against what was actually written is what tells a brush stroke
+    from any of those.
+    """
+    saved = settings.get(WRITTEN_KEY)
+    if saved is None or len(saved) != len(obj.data.vertices):
+        return False
+    current = read_weights(obj, settings.group_name)
+    if current is None:
+        return False
+    return any(abs(a - b) > 1e-4 for a, b in zip(current, saved))
+
+
+def detach(obj, settings):
+    """Let the group go, leaving the weights exactly as they stand.
+
+    Painting on a gradient's group is how you claim it - the same bargain as
+    Blender's redo panel, which closes the moment you do anything else. There is
+    no Apply button because this *is* Apply.
+    """
+    discard(obj, index_of(obj, settings))
 
 
 def _rewrite(self, context):
@@ -664,10 +779,9 @@ def _rewrite(self, context):
 
     A slider drag and a gizmo drag both fire this once per mouse-move event, and
     a full write per event is a slideshow on any real mesh. Flagging instead lets
-    the session's timer collapse a whole drag into one write per poll.
+    the overlay's timer collapse a whole drag into one write per poll.
     """
-    if self.active:
-        mark_dirty()
+    mark_dirty()
 
 
 def _invert_changed(self, context):
@@ -677,19 +791,43 @@ def _invert_changed(self, context):
 
 
 def _rename_group(self, context):
-    """A rename moves the gradient rather than leaving a copy behind.
+    """Re-aim the gradient at another group, taking its output with it.
 
-    Restoring first undoes everything the session wrote under the old name -
-    removing the group if the session created it, putting the weights back if it
-    did not - so only the group named right now carries the gradient. Add is what
-    makes a name permanent; before that, the name is still being chosen.
+    A group this gradient created has no other claim on it, so it goes rather
+    than being left behind empty of meaning. One the user already had stays
+    exactly as it is - it was theirs before the gradient adopted it, and the
+    backup that says what it held is dropped with the claim.
     """
+    if _healing:
+        return
     obj = context.active_object
-    if self.active and obj is not None:
-        restore(obj)
-        # Naming a group that was built with this tool picks its gradient back
-        # up, so an earlier one can be adjusted rather than rebuilt by eye.
-        load_record(obj, self, self.group_name)
+    if obj is not None and self.created_group and self.previous_group:
+        stale = obj.vertex_groups.get(self.previous_group)
+        if stale is not None:
+            obj.vertex_groups.remove(stale)
+    if self.previous_group:
+        drop_baseline(self)
+
+    self.created_group = False
+    self.previous_group = self.group_name
+    # The active vertex group is what selects a gradient, so re-aiming one has
+    # to move the selection with it - otherwise the panel is left showing a
+    # group whose gradient has just walked off, or nothing at all.
+    if obj is not None and self.group_name:
+        group = obj.vertex_groups.get(self.group_name)
+        if group is None:
+            group = obj.vertex_groups.new(name=self.group_name)
+            self.created_group = True
+        else:
+            # Captured on adoption, not lazily on the first write: by then the
+            # gradient has already overwritten the very weights the baseline is
+            # supposed to be. A group it created has no history to keep.
+            capture_baseline(self, obj)
+        obj.vertex_groups.active = group
+        # Where it sits now, so a later rename has something to be recognised
+        # by. The overlay timer refreshes this every poll thereafter.
+        self.group_index = group.index
+        self.group_count = len(obj.vertex_groups)
     _rewrite(self, context)
 
 
@@ -704,9 +842,15 @@ class TK_PG_gradient_handle(bpy.types.PropertyGroup):
     weight: bpy.props.FloatProperty(default=0.0, min=0.0, max=1.0)
 
 
-
 class TK_PG_weight_gradient(bpy.types.PropertyGroup):
-    """Settings and session state for the Weight Gradient tool."""
+    """One gradient: a path, a weight profile along it, and the group it writes.
+
+    An object holds a list of these, the way it holds modifiers. There is no
+    session and no commit - a gradient exists, it owns its vertex group, and it
+    stays editable. Deleting it is what cancelling used to be.
+    """
+
+    name: bpy.props.StringProperty(name="Name", default="Gradient")
 
     shape: bpy.props.EnumProperty(
         name="Shape", items=gradient.SHAPES, default='LINEAR', update=_rewrite
@@ -727,12 +871,6 @@ class TK_PG_weight_gradient(bpy.types.PropertyGroup):
         default=False,
         update=_rewrite,
     )
-    snap: bpy.props.EnumProperty(
-        name="Snap",
-        description="What a dragged handle lands on",
-        items=snapping.MODES,
-        default='FREE',
-    )
     ramp: bpy.props.PointerProperty(type=bpy.types.Texture)
     invert: bpy.props.BoolProperty(
         name="Invert",
@@ -751,23 +889,35 @@ class TK_PG_weight_gradient(bpy.types.PropertyGroup):
     )
     group_name: bpy.props.StringProperty(
         name="Group",
-        description="Vertex group the gradient is written into. Rename it and "
-        "Add again to build up several",
+        description="Vertex group this gradient writes. It owns that group - "
+        "point it at another and the weights move with it",
         default="Group",
         update=_rename_group,
+    )
+    blend: bpy.props.EnumProperty(
+        name="Blend",
+        description="What the gradient does to the weights the group already "
+        "had when it was adopted. A group the gradient created had none, so "
+        "everything but Replace leaves it empty",
+        items=gradient.BLENDS,
+        default='REPLACE',
+        update=_rewrite,
     )
     mask_group: bpy.props.StringProperty(
         name="Mask",
         description="Only write where this group has weight; elsewhere the "
-        "existing weights are left alone",
+        "weights the group had before the gradient adopted it are left alone",
         update=_rewrite,
     )
 
-    active: bpy.props.BoolProperty(default=False)
-    previous_mode: bpy.props.StringProperty(default='OBJECT')
-    # What this session has committed so far, so the panel can say. A joined
-    # string rather than a collection: it is only ever shown, never indexed.
-    added_names: bpy.props.StringProperty(default="")
+    # Whether the group is the gradient's to delete, and what it was called last
+    # time - the rename callback is told the new name, never the old one.
+    created_group: bpy.props.BoolProperty(default=False)
+    previous_group: bpy.props.StringProperty(default="")
+    # Where the group sat, and how many there were, the last time the two still
+    # lined up. That is the only evidence a rename in Blender's own list leaves.
+    group_index: bpy.props.IntProperty(default=-1)
+    group_count: bpy.props.IntProperty(default=-1)
 
 
 classes = (TK_PG_gradient_handle, TK_PG_weight_gradient)

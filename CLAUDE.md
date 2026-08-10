@@ -36,6 +36,40 @@ properties describe geometry, not anatomy. If generalising would actually cost
 real complexity, say so and let the user decide — do not silently hardcode the
 specific case.
 
+## Feel Blender-native
+
+**When a design decision is open, the option that matches how Blender itself
+behaves wins.** It is the one the user already knows, so it costs no learning
+and needs no explaining. This outranks tidiness, cleverness, and brevity when
+they conflict, and it applies to refining requirements as much as to writing
+code — if a proposed design has no counterpart anywhere in Blender, that is
+evidence against the design, not a gap to fill with invention.
+
+Novel mechanisms are allowed exactly where the feature has no precedent —
+draggable 3D handles and a colour ramp used as a weight scale are the genuinely
+new part of the gradient tool. Everything *around* the novel part must be
+ordinary Blender: its lists, its operators, its panel idioms, its warnings, its
+undo.
+
+Look for the precedent before inventing. `scripts/templates_py/` and Blender's
+own `scripts/startup/bl_ui/` are on disk and are the reference; read them rather
+than reasoning about what Blender "probably" does. Worked examples already used
+here: a modifier's **Apply**, `mesh.select_all`'s action enum for one operator
+with several modes, the F9 redo panel, `template_list` over real data,
+`object.vertex_group_add` rather than a bespoke add button.
+
+Two patterns Blender does not have, so neither do we:
+
+- **A modal "this changed — choose one" dialog.** Blender states the situation
+  in a static panel line ("Applying modifier will delete shape keys") and lets
+  regeneration win; F9 redo and hair-particle edit both discard hand work with no
+  prompt at all. Ctrl+Z is the undo, and an explicit Apply is how the user claims
+  generated data.
+- **A second list shadowing one Blender already keeps.** If the add-on's data is
+  per-vertex-group, per-bone or per-modifier, it is an *attribute* of that thing,
+  looked up from Blender's own list — never a parallel list the user has to map
+  across. That mistake is what the gradient tool's own history is a record of.
+
 ## Discuss a new feature before building it
 
 New features start as a conversation, not an implementation. Before writing
@@ -113,12 +147,13 @@ These are deliberate. Keep them.
 - **No logic in any `__init__.py`.** They hold `bl_info`, imports, and
   `register()`/`unregister()` loops over a local `classes` tuple. The single
   allowed exception is registration that has to *bracket* the class loop —
-  `tools/weights/__init__.py` assigns and deletes `bpy.types.Object.tk_gradient`
-  and calls `overlay.disable()`, because a PointerProperty cannot exist before
-  its PropertyGroup and a draw handler must not outlive the add-on.
+  `tools/weights/__init__.py` assigns and deletes the two
+  `bpy.types.Object.tk_gradient*` properties and calls `overlay.enable()` /
+  `overlay.disable()`, because a CollectionProperty cannot exist before its
+  PropertyGroup and a draw handler must neither predate nor outlive the add-on.
 - **Class naming:** `TK_OT_*` operators, `TK_PT_*` panels, `TK_MT_*` menus,
-  `TK_PG_*` property groups, `TK_GGT_*` gizmo groups. Operator ids are
-  `tk.<verb_noun>`.
+  `TK_PG_*` property groups, `TK_GGT_*` gizmo groups, `TK_GT_*` gizmos,
+  `TK_UL_*` UI lists. Operator ids are `tk.<verb_noun>`.
 - **Keep the maths out of the operator.** `tools/weights/gradient.py` imports no
   `bpy` at all, so the falloff shapes and profiles are tested directly. Anything
   with real logic in it should be factored the same way.
@@ -214,14 +249,100 @@ old ones are what bpy has registered.
   screen, so `bpy.context.active_object` is `None` there — fall back to
   `context.view_layer.objects.active`.
 - **`VertexGroup` cannot hold custom properties** — `bpy_struct[key] = val: id
-  properties not supported for this type`. Per-group metadata has to live in a
-  dict on the object keyed by group name, which orphans when the group is
-  renamed outside the add-on.
-- **A live mask must blend against a snapshot, not the current weights.** The
-  session rewrites on every property change; `existing + (target - existing) *
+  properties not supported for this type`. That is why a gradient stores the
+  group *name* and lives in `Object.tk_gradients` rather than on the group.
+- **There is no vertex-group rename hook, so a rename is *inferred*.**
+  `purge_orphans()` follows one when the name is gone, the group count has not
+  moved since the last look, and the group at the remembered `group_index` has no
+  gradient of its own; anything else - deleted, reordered - drops the gradient
+  rather than adopting the wrong group. The snapshot is refreshed by
+  `remember_groups()` after every purge, which is why the overlay timer runs
+  whether or not the handles are showing. It is a write, so it never runs from
+  `draw`.
+- **The draw handler and the write timer run for the add-on's lifetime.**
+  `overlay.enable()` is called from `weights/__init__.py`'s `register()` and
+  `disable()` from `unregister()`; nothing switches them mid-session. They cost
+  nothing when `showing()` is False, and a file opened with gradients already in
+  it has nobody to switch them on. There was a Show Handles toggle gating this
+  once — it meant nothing, because nobody opens a gradient's panel in order not
+  to see it, and while it was off a changed setting marked the gradient dirty and
+  then never got written.
+- **`template_color_ramp`'s `expand` does not hide anything.** It changes the
+  widget's layout, not which controls appear - the colour-mode and interpolation
+  dropdowns, the swatch and `Pos` are all drawn either way. A panel section of
+  per-handle weight sliders was once added on the belief that `expand=False`
+  removed `Pos`; it was a second editor for numbers the bar already edits, and it
+  was deleted. The ramp is the only weight editor. `normalise_ramp` overwriting
+  the two dropdowns every poll is the price, and it is cheap.
+- **`lock_weight` stops Blender's paint tools, not the API.** `group.add()`
+  writes straight through a locked group - probed. Anything writing on a timer
+  has to check the flag itself, or the lock in the vertex group list means
+  nothing. The live rewrite skips a locked group; an explicit operator the user
+  aimed at that group (Remove's restore) does not.
+- **A live mask must blend against a baseline, not the current weights.** The
+  gradient rewrites on every property change; `existing + (target - existing) *
   influence` read off the mesh feeds its own last result back in, so a
   half-masked vertex walks towards the full gradient one tweak at a time and the
-  soft edge erodes. Blend against what the session found.
+  soft edge erodes. It has to be captured when the gradient *adopts* the group —
+  capture it lazily on first write and the gradient has already overwritten what
+  it was meant to record.
+- **The baseline is an ID property array on the gradient, not a backup vertex
+  group.** A `tk.backup.<group>` group worked and was visible: a junk row in the
+  user's own vertex group list, in every modifier's group dropdown and in the
+  export, none of which an add-on can filter. `settings["baseline"]` is a real
+  datablock write, so it survives undo, a save and a Reload Scripts exactly as
+  the group did — the original objection was to a *module-level dict*, which none
+  of those survive. It also dies with the gradient and needs no name tracked
+  through a rename. `NOT_A_MEMBER = -1.0` encodes "was not in the group" because
+  weights are 0..1; without it every vertex comes back a member weighing zero.
+  `baseline_of` refuses an array whose length no longer matches the mesh.
+- **A `bpy.types.Operator` cannot hold ID properties** — `this type doesn't
+  support IDProperties`. The gradient PropertyGroup can, which is why
+  `write_weights` takes an explicit `baseline=` for the one-shot operator and
+  only consults the stored one for a real gradient.
+- **A gradient is an attribute of a vertex group, not an item in a list of its
+  own.** Two dead ends are recorded here. First a *session* — Start, Add, Finish,
+  Cancel, with backup groups and a saved-record dict to make a live destructive
+  write reversible: three peer buttons for two operations, and a committed
+  gradient could only be reached again by typing its group name into a search
+  field. Then a `CollectionProperty` with its own `UIList`, which deleted the
+  transaction but shadowed Blender's vertex group list — two lists, one
+  selection, and nothing saying which was the master. What works is neither: the
+  panel draws `obj.vertex_groups` and `active_gradient()` looks the gradient up
+  by the active group's name. Do not reintroduce a commit step, and do not
+  reintroduce a second list.
+- **Painting on the group is the only exit, and it is also Apply.** There were
+  Reset, Remove and Apply buttons; all three went. Reset is Ctrl+Z with extra
+  steps, and the other two collapse into one act: a brush stroke on a
+  gradient-driven group detaches the gradient and leaves the weights exactly as
+  they stand. The precedent is Blender's redo panel, which closes the moment you
+  do anything else. Nothing in the module deletes a vertex group — the weights
+  are the work.
+- **Detaching cannot be inferred from the depsgraph alone.** A posed armature, a
+  shape key slider and a modifier tweak all update the mesh, and detaching on any
+  of those would be a disaster on a rigged character. `_on_depsgraph` raises a
+  *suspicion*; the timer confirms it with `hand_painted()`, which compares the
+  group against `settings["written"]` — the values the gradient actually wrote.
+  The confirm is skipped while `pending()`, so a drag (which rewrites every poll)
+  never pays for the full read.
+- **`blend` composes against the baseline, not the current weights**, exactly as
+  the mask does and for the same reason. That is what makes the mode reversible
+  with no Remove button: the originals are still in the baseline, so switching
+  back to Replace and out again recomputes rather than compounding. The mode
+  names and set are Blender's Vertex Weight Mix ones.
+- **Do not subclass a registered Blender UI class.** A `TK_UL_vgroups(MESH_UL_vgroups)`
+  looked obvious and registers fine — but *unregistering* it makes Blender
+  regenerate the parent's RNA subtype and raise `metaclass conflict: the
+  metaclass of a derived class must be a (non-strict) subclass of the
+  metaclasses of all its bases`, which aborts the loop and leaves the add-on
+  half unregistered. Copy the handful of lines from `scripts/startup/bl_ui/`
+  instead. (That list is gone now — see the next entry — but the trap stands.)
+- **The panel draws no vertex group list at all.** Object Data Properties
+  already has one; a copy in the N-panel is a second thing to keep in step, and
+  the whole point of dropping the gradient list was to stop shadowing lists
+  Blender already keeps. The panel names the active group and works on it. The
+  cost, accepted: nothing marks which groups are gradient-driven, because
+  Blender's own list is not ours to draw into.
 - Gizmo groups are **not** exposed as `bpy.types.<name>` the way panels are, and
   `bl_rna` survives `unregister_class`. To test registration use
   `bpy.types.GizmoGroup.bl_rna_get_subclass_py("TK_GGT_...")`, which is `None`
@@ -234,21 +355,35 @@ old ones are what bpy has registered.
   commented out under "The location callback handles the location". That
   templates directory is the reference for anything gizmo-shaped — it is on disk
   and it is right, which beats reasoning about the C.
-- **`move_3d` leaves a finished drag in `matrix_basis` *and* `matrix_offset`,
-  both of which are added to the target's location.** So a setter that adjusts
-  what it stores — snapping, clamping — leaves the disc where the cursor let go,
-  sliding in the view plane while the data underneath it is the snapped point.
-  Reset both to identity in `draw_prepare`, guarded on `Gizmo.is_modal` or you
-  clear the drag in progress. **Not in `refresh`, which does not run per
-  redraw** — that is why the stale handle only corrected itself when something
-  else forced a refresh, such as dragging a different one.
+- **A built-in gizmo that owns its drag cannot be made to snap.** `move_3d`
+  accumulates the mouse delta into `matrix_basis`/`matrix_offset`, both of which
+  are *added* to whatever the target handler reports, and it never re-reads the
+  target while modal. A setter that adjusts what it stores therefore moves the
+  data and not the disc: the handle slides in the view plane while the path
+  underneath it snaps, and it only corrects itself when something else forces a
+  refresh — such as dragging a *different* handle. No amount of resetting the
+  matrices in `draw_prepare` fixes that; `TK_GT_gradient_handle` is a custom
+  `Gizmo` with its own `invoke`/`modal`/`exit`, no target handler, and
+  `matrix_basis` rebuilt from the stored point every redraw.
 - **`Gizmo.use_draw_modal` ("Show while dragging") defaults to False**, so a
-  gizmo is not drawn at all during its own drag. Anything that has to stay
-  visible mid-drag must be drawn by the add-on's own handler —
-  `HANDLE_POINT_SIZE` exists for exactly that.
-- **Snap in the gizmo setter, never in the timer.** `bpy.context.region_data` is
-  only there in the setter's context; without it the snap falls back to
-  nearest-in-3D, which yanks a handle to the far side of the mesh.
+  gizmo is not drawn at all during its own drag. Set it, rather than drawing a
+  stand-in marker from the add-on's own handler.
+- **Position a custom gizmo's modal from `event.mouse_region_x/y`, not from a
+  delta** — that is the whole point of owning the modal, and it is the only way
+  to get a true cursor ray (`view3d_utils.region_2d_to_origin_3d` /
+  `region_2d_to_vector_3d`). It also rules out `use_grab_cursor`, which wraps
+  the pointer at the region edge and would teleport an absolute position.
+- **Never snap by nearest-point-in-3D.** A handle dragged past the surface is
+  still under the cursor on the near side; `closest_point_on_mesh` answers with
+  the far side. Ray only, and a ray that misses returns the caller's fallback
+  rather than moving the handle at all.
+- **The cursor points at *evaluated* geometry, but the gradient measures base
+  coordinates.** `snapping` builds its BVH over
+  `obj.evaluated_get(depsgraph).to_mesh()` and carries the hit back with
+  `mathutils.geometry.barycentric_transform` over the hit triangle's three
+  vertices — exact for any stack that preserves vertex order (shape keys,
+  armature, lattice). When the counts disagree (subsurf, mirror) there is no
+  mapping, and the evaluated point stands in.
 - **`obj.ray_cast` and `obj.closest_point_on_mesh` query *evaluated* geometry** —
   their docstrings say so — while the polygon index they return is only useful
   against `obj.data`. With a shape key or a deform modifier the two disagree, and

@@ -1,4 +1,4 @@
-"""Viewport feedback for an active Weight Gradient session.
+"""Viewport feedback for the gradient being edited.
 
 The shader is built on first draw, never at import or register time:
 gpu.shader.from_builtin() raises SystemError until the GPU module is
@@ -21,6 +21,12 @@ _mask_cache = (None, None)
 # The ramp as it was last seen, so an edit to it can be noticed at all.
 _signature = None
 
+# Set by the depsgraph when the mesh changed for a reason that was not us. Only
+# a suspicion: a posed armature, a shape key slider and a modifier tweak all
+# raise it too, so the timer confirms it against what was actually written
+# before letting go of the group.
+_suspect = False
+
 
 # A fixed pool of gizmos, hidden down to the handle count, so the gizmo
 # collection is never mutated at runtime. 32 because that is Blender's own hard
@@ -31,11 +37,10 @@ MAX_HANDLES = 32
 
 LINE_COLOUR = (1.0, 1.0, 1.0, 0.6)
 
-# The dot drawn at every handle, in pixels. It has to read as the handle on its
-# own: Gizmo.use_draw_modal defaults to False, so the gizmo's own disc is not
-# drawn at all while it is being dragged, and this is the only marker left.
-# Sized to sit roughly where the disc was rather than as a pinprick inside it.
-HANDLE_POINT_SIZE = 18.0
+# The handle disc, as a fraction of the gizmo's own screen-space scale, and how
+# far from its centre a click still counts as grabbing it, in pixels.
+HANDLE_RADIUS = 0.12
+HANDLE_PICK_RADIUS = 22.0
 
 # Fast enough that clicking + on the ramp feels immediate, slow enough that the
 # poll is free.
@@ -115,8 +120,8 @@ def _mask_batch(obj, settings):
     that cache is a write to the mesh and a draw handler is a read-only context.
 
     ponytail: rebuilt when the object, the mask or the topology changes, not
-    when the mask's weights do - repainting the mask mid-session needs the field
-    re-picked to show. Watching the weights costs a full scan on every redraw.
+    when the mask's weights do - repainting the mask needs the field re-picked
+    to show. Watching the weights costs a full scan on every redraw.
     """
     global _mask_cache
     mesh = obj.data
@@ -172,11 +177,9 @@ def _draw_mask(obj, settings):
 def _draw():
     context = bpy.context
     obj = context.active_object
-    if obj is None or obj.type != 'MESH':
+    if not properties.showing(obj):
         return
-    settings = obj.tk_gradient
-    if not settings.active:
-        return
+    settings = properties.active_gradient(obj)
 
     import gpu
     from gpu_extras.batch import batch_for_shader
@@ -192,23 +195,18 @@ def _draw():
         return
 
     gpu.state.depth_test_set('NONE')
-    gpu.state.point_size_set(HANDLE_POINT_SIZE)
 
     shader.bind()
     if lines:
         shader.uniform_float("color", LINE_COLOUR)
         batch_for_shader(shader, 'LINES', {"pos": lines}).draw(shader)
 
-    for point, colour in zip(handles, properties.handle_colours(settings)):
-        shader.uniform_float("color", colour)
-        batch_for_shader(shader, 'POINTS', {"pos": [point]}).draw(shader)
-
     gpu.state.blend_set('NONE')
     gpu.state.depth_test_set('LESS_EQUAL')
 
 
 def _sync():
-    """The session's heartbeat: follow the ramp, and do the deferred writes.
+    """The heartbeat while editing: follow the ramp, do the deferred writes.
 
     Two jobs, both of which have to be here rather than anywhere more direct.
 
@@ -226,12 +224,30 @@ def _sync():
     global _signature
     context = bpy.context
     obj = context.active_object or context.view_layer.objects.active
-    settings = getattr(obj, "tk_gradient", None) if obj is not None else None
-    if settings is None or not settings.active:
-        return None  # session over; the timer retires with it
+    if obj is not None and obj.type == 'MESH':
+        # A group renamed in Blender's own list leaves its gradient pointing at
+        # nothing. This is the writable context that can clear that up.
+        properties.purge_orphans(obj)
+    settings = properties.active_gradient(obj)
+    if settings is None:
+        # No gradient on the active group - another object, or none selected.
+        # Keep polling: this is the add-on's write engine and it retires only
+        # when the add-on does.
+        return SYNC_INTERVAL
+
+    global _suspect
+    if _suspect:
+        _suspect = False
+        # Skipped while a write is already queued, which is every poll of a
+        # drag: the comparison costs a full read of the group, and the rewrite
+        # about to happen would make it meaningless anyway.
+        if not properties.pending() and properties.hand_painted(obj, settings):
+            properties.detach(obj, settings)
+            return SYNC_INTERVAL
 
     if properties.normalise_ramp(settings):
         properties.mark_dirty()
+
     if properties.sync_handles_to_ramp(settings):
         properties.mark_dirty()
     signature = properties.ramp_signature(settings)
@@ -256,6 +272,8 @@ def _on_depsgraph(scene, depsgraph):
     which would rebuild several times a second."""
     if properties.writing():
         return
+    global _suspect
+    _suspect = True
     invalidate_mask()
     # Only when the geometry itself moved. A handle position is a property on
     # the object, and writing one still fires this handler - so invalidating
@@ -293,36 +311,117 @@ def disable():
         bpy.app.handlers.depsgraph_update_post.remove(_on_depsgraph)
 
 
-def _handle_accessors(index):
-    """Get/set closures mapping one gizmo onto one handle, in world space."""
+def _disc_shape_verts(segments=24):
+    """A unit disc as triangles, in the gizmo's own XY plane."""
+    ring = [
+        (math.cos(a), math.sin(a), 0.0)
+        for a in (i / segments * math.tau for i in range(segments + 1))
+    ]
+    return [
+        point
+        for i in range(segments)
+        for point in ((0.0, 0.0, 0.0), ring[i], ring[i + 1])
+    ]
 
-    def settings_and_object():
-        obj = bpy.context.active_object
-        return (obj.tk_gradient if obj is not None else None), obj
 
-    def get():
-        settings, obj = settings_and_object()
-        if settings is None or index >= len(settings.handles):
-            return [0.0, 0.0, 0.0]
-        return list(obj.matrix_world @ Vector(settings.handles[index].position))
+def _handle_of(gizmo):
+    """The object and handle a gizmo stands for, or (None, None)."""
+    obj = bpy.context.active_object
+    settings = properties.active_gradient(obj) if properties.showing(obj) else None
+    if settings is None or gizmo.index >= len(settings.handles):
+        return None, None
+    return obj, settings.handles[gizmo.index]
 
-    def set(value):
-        settings, obj = settings_and_object()
-        if settings is None or index >= len(settings.handles):
-            return
-        local = obj.matrix_world.inverted() @ Vector(value)
-        # Snapped here rather than on release, so the handle lands on the
-        # geometry as it moves and the path redraws through where it will
-        # actually end up. The gizmo reads its own position back through get(),
-        # so it follows the snap rather than the raw cursor.
-        #
-        # region_data is what lets the snap aim down the view ray - it is the
-        # cursor's direction, and only this context has it. A timer does not.
-        settings.handles[index].position = snapping.snap(
-            obj, local, settings.snap, bpy.context.region_data
+
+class TK_GT_gradient_handle(bpy.types.Gizmo):
+    """One draggable handle, positioned by the add-on rather than by the gizmo.
+
+    `GIZMO_GT_move_3d` was what this used to be, and it cannot snap. It owns its
+    drag: the mouse delta accumulates into `matrix_basis`/`matrix_offset`, both
+    of which are *added* to whatever its target reports, and it never re-reads
+    the target while modal. So a setter that snapped moved the data and not the
+    disc - the handle slid in the view plane while the path underneath it went
+    to the surface, and only a later refresh, forced by dragging some *other*
+    handle, put the two back together.
+
+    Owning the modal instead means the position comes from the real cursor ray
+    every event, `matrix_basis` is rebuilt from the stored point on every
+    redraw, and `matrix_offset` is never written at all. `use_draw_modal` is
+    what keeps the disc drawn during its own drag; it defaults to False.
+    """
+
+    bl_idname = "TK_GT_gradient_handle"
+
+    __slots__ = ("custom_shape", "index", "init_position")
+
+    def setup(self):
+        if not hasattr(self, "custom_shape"):
+            self.custom_shape = self.new_custom_shape('TRIS', _disc_shape_verts())
+        self.index = 0
+        self.init_position = (0.0, 0.0, 0.0)
+
+    def draw(self, context):
+        self.draw_custom_shape(self.custom_shape)
+
+    def test_select(self, context, location):
+        """Pick in 2D, so the pick radius is the disc as it looks on screen."""
+        obj, handle = _handle_of(self)
+        if obj is None:
+            return -1
+        from bpy_extras.view3d_utils import location_3d_to_region_2d
+
+        screen = location_3d_to_region_2d(
+            context.region, context.region_data,
+            obj.matrix_world @ Vector(handle.position),
+        )
+        if screen is None:
+            return -1
+        distance = (screen - Vector(location)).length
+        return int(distance) if distance <= HANDLE_PICK_RADIUS else -1
+
+    def invoke(self, context, event):
+        _obj, handle = _handle_of(self)
+        if handle is None:
+            return {'CANCELLED'}
+        self.init_position = tuple(handle.position)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event, tweak):
+        obj, handle = _handle_of(self)
+        if obj is None:
+            return {'CANCELLED'}
+        from bpy_extras import view3d_utils
+
+        region, region_data = context.region, context.region_data
+        mouse = (event.mouse_region_x, event.mouse_region_y)
+        to_local = obj.matrix_world.inverted()
+
+        # The plane the handle started on is where a FREE drag - and a ray that
+        # misses the mesh - has to land, or the handle would have no depth.
+        world_start = obj.matrix_world @ Vector(self.init_position)
+        fallback = to_local @ view3d_utils.region_2d_to_location_3d(
+            region, region_data, mouse, world_start
         )
 
-    return get, set
+        origin = to_local @ view3d_utils.region_2d_to_origin_3d(
+            region, region_data, mouse
+        )
+        direction = (
+            to_local.to_3x3()
+            @ view3d_utils.region_2d_to_vector_3d(region, region_data, mouse)
+        ).normalized()
+
+        handle.position = snapping.snap(
+            obj, origin, direction, obj.tk_gradient_snap, fallback
+        )
+        properties.mark_dirty()
+        return {'RUNNING_MODAL'}
+
+    def exit(self, context, cancel):
+        _obj, handle = _handle_of(self)
+        if cancel and handle is not None:
+            handle.position = self.init_position
+            properties.mark_dirty()
 
 
 class TK_GGT_weight_gradient(bpy.types.GizmoGroup):
@@ -337,55 +436,60 @@ class TK_GGT_weight_gradient(bpy.types.GizmoGroup):
     @classmethod
     def poll(cls, context):
         obj = context.active_object
-        return bool(obj and obj.type == 'MESH' and obj.tk_gradient.active)
+        return properties.showing(obj)
 
     def setup(self, context):
         # A fixed pool, hidden as needed: this never mutates the gizmo
         # collection at runtime.
         self.handle_gizmos = []
         for index in range(MAX_HANDLES):
-            gizmo = self.gizmos.new("GIZMO_GT_move_3d")
-            # FILL makes it a solid disc; without it move_3d draws a ring
-            # outline, which is what reads as hollow over weight paint.
-            gizmo.draw_options = {'ALIGN_VIEW', 'FILL'}
+            gizmo = self.gizmos.new(TK_GT_gradient_handle.bl_idname)
+            gizmo.index = index
             gizmo.alpha = 0.9
             gizmo.color_highlight = (1.0, 1.0, 1.0)
             gizmo.alpha_highlight = 1.0
-            gizmo.scale_basis = 0.12
-            get, set = _handle_accessors(index)
-            gizmo.target_set_handler("offset", get=get, set=set)
+            gizmo.scale_basis = HANDLE_RADIUS
+            gizmo.use_draw_modal = True  # or the disc vanishes during its drag
+            # No use_grab_cursor: it wraps the pointer at the region edge, and
+            # the position here comes from the absolute mouse coordinate rather
+            # than an accumulated delta, so a wrap would teleport the handle.
+            gizmo.use_undo = True
             self.handle_gizmos.append(gizmo)
         self.draw_prepare(context)
 
     def draw_prepare(self, context):
-        """Hold every gizmo to the handles, once per redraw.
+        """Hold every gizmo to its handle, once per redraw.
 
-        Both `matrix_basis` and `matrix_offset` are *added* to the location the
-        target handler reports, and move_3d leaves its finished drag in them. So
-        a handle that snapped stays drawn where the cursor let go - sliding in
-        the view plane, never landing on the surface - while the path underneath
-        it is rebuilt from the snapped point. Identity on both is what makes the
-        target the only thing deciding where a handle is drawn.
+        `matrix_basis` is the whole position - `matrix_offset` is left at
+        identity, because the two compose and writing both puts a handle at
+        twice its distance from the origin. Rebuilt here rather than in
+        `refresh`, which does not run per redraw, and *not* skipped while modal:
+        the drag writes the handle, so this is what draws the drag.
 
-        All of it here rather than in `refresh`, which does not run per redraw:
-        that is why the stale one only used to correct itself when something
-        *else* forced a refresh, like dragging a different handle. Skipped while
-        a gizmo is modal, because then the matrix is the drag in progress.
+        The rotation faces the view, which is what `move_3d`'s ALIGN_VIEW used
+        to do for the disc it drew.
         """
         obj = context.active_object
-        if obj is None:
+        settings = properties.active_gradient(obj) if properties.showing(obj) else None
+        if settings is None:
             return
-        settings = obj.tk_gradient
+
+        facing = Matrix.Identity(4)
+        if context.region_data is not None:
+            facing = context.region_data.view_matrix.inverted().to_3x3().to_4x4()
 
         count = min(len(settings.handles), MAX_HANDLES)
         colours = properties.handle_colours(settings)
         for index, gizmo in enumerate(self.handle_gizmos):
             gizmo.hide = index >= count
-            if gizmo.hide or gizmo.is_modal:
+            if gizmo.hide:
                 continue
             gizmo.color = colours[index][:3]
-            gizmo.matrix_basis = Matrix.Identity(4)
-            gizmo.matrix_offset.identity()
+            matrix = facing.copy()
+            matrix.translation = obj.matrix_world @ Vector(
+                settings.handles[index].position
+            )
+            gizmo.matrix_basis = matrix
 
 
-classes = (TK_GGT_weight_gradient,)
+classes = (TK_GT_gradient_handle, TK_GGT_weight_gradient)

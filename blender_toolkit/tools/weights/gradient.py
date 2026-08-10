@@ -199,6 +199,98 @@ def handle_arc_positions(points, count, curved=False, per_segment=None):
     ]
 
 
+# What the gradient does to the weights the group already held. The same set
+# and the same names as Blender's Vertex Weight Mix modifier, because that is
+# the tool a user reaches for to do this by hand.
+BLENDS = (
+    ('REPLACE', "Replace", "The gradient's weight, ignoring what was there"),
+    ('ADD', "Add", "Add the gradient to what was there"),
+    ('MULTIPLY', "Multiply", "Scale what was there by the gradient"),
+    ('MIN', "Minimum", "The lower of the two"),
+    ('MAX', "Maximum", "The higher of the two"),
+)
+
+
+def blend(mode, base, value):
+    """Compose a gradient weight with the one the group already had."""
+    if mode == 'REPLACE':
+        return value
+    if mode == 'ADD':
+        return _clamp(base + value)
+    if mode == 'MULTIPLY':
+        return base * value
+    if mode == 'MIN':
+        return min(base, value)
+    if mode == 'MAX':
+        return max(base, value)
+    raise ValueError(f"Unknown blend mode: {mode}")
+
+
+def point_at_arc(points, fraction, metrics=None):
+    """The point `fraction` of the way along a polyline, by arc length."""
+    lengths, offsets, total = metrics or segment_lengths(points)
+    if not total:
+        return points[0]
+
+    target = _clamp(fraction) * total
+    for index, length in enumerate(lengths):
+        if not length:
+            continue
+        if offsets[index] + length >= target:
+            t = (target - offsets[index]) / length
+            return _add(points[index], _scale(_sub(points[index + 1], points[index]), t))
+    return points[-1]
+
+
+def spaced_positions(handles, curved=False):
+    """Handle positions respaced at equal arc length, the ends pinned.
+
+    The counterpart of spreading the weights evenly: that decides what value
+    each handle reaches, this decides where along the path it sits. Hand-dragged
+    handles bunch up, and no amount of editing the ramp fixes that.
+
+    On a curved path the samples are respaced along the *current* curve, and the
+    curve is then rebuilt from the new handles - so it shifts a little and a
+    second press converges. Straight is exact in one.
+    """
+    points = path_points(handles, curved)
+    count = len(handles)
+    if count < 3:
+        return [tuple(h) for h in handles]
+
+    metrics = segment_lengths(points)
+    if not metrics[2]:  # every handle in one place; nothing to space out
+        return [tuple(h) for h in handles]
+    return [point_at_arc(points, i / (count - 1), metrics) for i in range(count)]
+
+
+def relax_positions(handles, factor=0.5, repeat=1):
+    """Interior handles pulled towards the midpoint of their neighbours.
+
+    Not the same operation as spacing evenly, and it does not converge to it:
+    this shortens the path, straightening kinks and pulling a bend towards its
+    chord. Repeating walks a path towards a straight line, which is the point -
+    it is a strength dial, not an idempotent tidy-up.
+
+    One pass reads every position from the pass before it, so a run of handles
+    relaxes symmetrically rather than dragging in the order they are visited.
+    """
+    current = [tuple(h) for h in handles]
+    if len(current) < 3:
+        return current
+
+    for _ in range(max(repeat, 0)):
+        previous = current
+        current = [previous[0]]
+        for index in range(1, len(previous) - 1):
+            midpoint = _scale(_add(previous[index - 1], previous[index + 1]), 0.5)
+            current.append(
+                _add(previous[index], _scale(_sub(midpoint, previous[index]), factor))
+            )
+        current.append(previous[-1])
+    return current
+
+
 def weight_curve(knots, ease=None):
     """Mapping through `(position, weight)` pairs, or None.
 

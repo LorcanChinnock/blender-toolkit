@@ -131,7 +131,27 @@ def flush(obj):
     """
     from blender_toolkit.tools.weights import properties
 
-    properties.flush(bpy.context, obj.tk_gradient)
+    properties.flush(bpy.context, properties.active_gradient(obj))
+
+
+def _detach(obj):
+    """Drop the active group's gradient the only way there is - by painting."""
+    from blender_toolkit.tools.weights import properties
+
+    settings = properties.active_gradient(obj)
+    group = obj.vertex_groups[settings.group_name]
+    group.add([0], 1.0 - group.weight(0), 'REPLACE')  # a stroke, near enough
+    assert properties.hand_painted(obj, settings) is True
+    properties.detach(obj, settings)
+
+
+def _add_gradient(obj, **kwargs):
+    """Add a gradient the way the panel's + does, and return it."""
+    from blender_toolkit.tools.weights import properties
+
+    options = {"source": 'BOUNDS', "axis": 'X', **kwargs}
+    assert bpy.ops.tk.add_gradient(**options) == {'FINISHED'}
+    return properties.active_gradient(obj)
 
 
 def _offset(key, index):
@@ -448,121 +468,119 @@ def test_weight_colours_round_trip():
 
 
 def test_snapping():
+    """Snap along the cursor's ray, and only along it."""
     from blender_toolkit.tools.weights import snapping
 
     reset()
     bpy.ops.mesh.primitive_uv_sphere_add(segments=32, ring_count=16, radius=1.0)
     obj = bpy.context.active_object
-    outside = (2.0, 0.0, 0.0)
 
-    assert tuple(snapping.snap(obj, outside, 'FREE')) == outside
+    # Front view: the ray starts at -Y and runs towards +Y through the origin.
+    origin, direction = Vector((0.0, -10.0, 0.0)), Vector((0.0, 1.0, 0.0))
+    fallback = Vector((5.0, 5.0, 5.0))
 
-    on_face = snapping.snap(obj, outside, 'FACE')
+    assert snapping.snap(obj, origin, direction, 'FREE', fallback) == fallback
+
+    on_face = snapping.snap(obj, origin, direction, 'FACE', fallback)
     assert abs(on_face.length - 1.0) < 1e-4, on_face.length
+    # The near side. Nearest-in-3D used to answer with the far one, which is
+    # what yanked a handle to the other side of the mesh mid-drag.
+    assert on_face.y < 0.0, tuple(on_face)
 
-    on_vertex = snapping.snap(obj, outside, 'VERTEX')
-    assert any(
+    on_vertex = snapping.snap(obj, origin, direction, 'VERTEX', fallback)
+    assert on_vertex.y < 0.0 and any(
         (v.co - on_vertex).length < 1e-6 for v in obj.data.vertices
     ), tuple(on_vertex)
 
-    # An edge point lies on some polygon edge of the sphere.
-    on_edge = snapping.snap(obj, outside, 'EDGE')
+    # An edge point lies on a real edge - never on a triangulation diagonal
+    # across a quad, which is not something the user can see to aim at.
+    on_edge = snapping.snap(obj, origin, direction, 'EDGE', fallback)
     best = min(
         (snapping._nearest_on_segment(
             on_edge, obj.data.vertices[a].co, obj.data.vertices[b].co
         ) - on_edge).length
-        for polygon in obj.data.polygons
-        for a, b in polygon.edge_keys
+        for edge in obj.data.edges
+        for a, b in (edge.vertices,)
     )
-    assert best < 1e-6, best
+    assert on_edge.y < 0.0 and best < 1e-6, (tuple(on_edge), best)
 
-    # A non-mesh object must pass the point straight through, not explode.
+    # A ray that misses gives the fallback back untouched. Falling back to the
+    # nearest point instead is what made a handle jump when the cursor left the
+    # mesh.
+    missed = snapping.snap(obj, Vector((50.0, -10.0, 0.0)), direction, 'FACE', fallback)
+    assert missed == fallback, tuple(missed)
+
+    # A non-mesh object must pass it straight through, not explode.
     bpy.ops.object.empty_add()
-    assert tuple(snapping.snap(bpy.context.active_object, outside, 'VERTEX')) == outside
+    assert snapping.snap(
+        bpy.context.active_object, origin, direction, 'VERTEX', fallback
+    ) == fallback
 
 
-def test_snapping_uses_base_geometry():
-    """Every mode lands on the base cage, whatever the evaluated mesh looks like.
+def test_snapping_hits_the_visible_surface():
+    """Aim at the deformed mesh, store the matching base coordinate.
 
-    `ray_cast` and `closest_point_on_mesh` query evaluated geometry, so indexing
-    `obj.data` with the polygon they return put FACE on the deformed surface and
-    VERTEX/EDGE on the base one - and raised outright once a modifier changed
-    the topology.
+    The viewport shows evaluated geometry, so that is what the cursor is
+    pointing at - but the gradient measures base coordinates, and that is what
+    a handle holds. The hit is carried back through the triangle it landed in,
+    which is exact for any stack that preserves vertex order.
     """
     from blender_toolkit.tools.weights import snapping
 
     reset()
     obj = _grid_with_key(subdivisions=4)
-    obj.active_shape_key.value = 1.0  # the evaluated surface a metre above base
-    obj.modifiers.new("Sub", 'SUBSURF').levels = 2  # base 16 polygons, evaluated 256
+    obj.active_shape_key.value = 1.0  # the visible surface is now a metre up
     bpy.context.view_layer.update()
-
-    probe = Vector((0.3, 0.3, 0.0))
-    for mode in ('FACE', 'VERTEX', 'EDGE'):
-        got = snapping.snap(obj, probe, mode)
-        assert abs(got.z) < 1e-6, (mode, tuple(got))  # the flat base, not z = 1
-
-    # The cache keys on topology alone, so moving vertices needs an explicit
-    # drop - which is what the depsgraph handler fires on a real mesh edit.
-    for vert in obj.data.vertices:
-        vert.co.x += 10.0
     snapping.invalidate()
-    assert snapping.snap(obj, Vector((10.3, 0.3, 0.0)), 'VERTEX').x > 9.0
 
-    # A depsgraph update that did not touch geometry must leave the tree alone.
-    # Writing a handle position fires the handler once per mouse-move event, and
-    # rebuilding there costs ~31 ms per 40k verts inside the drag.
+    fallback = Vector((5.0, 5.0, 5.0))
+    down = Vector((0.0, 0.0, -1.0))
+
+    # Aimed from above: the ray meets the evaluated surface at z = 1 ...
+    got = snapping.snap(obj, Vector((0.3, 0.3, 10.0)), down, 'FACE', fallback)
+    assert abs(got.z) < 1e-6, tuple(got)          # ... and lands on base z = 0
+    assert abs(got.x - 0.3) < 1e-4 and abs(got.y - 0.3) < 1e-4, tuple(got)
+
+    # And the base cage itself is not what gets hit - a ray that only crosses
+    # z = 0 misses entirely.
+    grazing = snapping.snap(
+        obj, Vector((-10.0, 0.3, 0.0)), Vector((1.0, 0.0, 0.0)), 'FACE', fallback
+    )
+    assert grazing == fallback, tuple(grazing)
+
+    # A stack that renumbers the vertices has no mapping back, so the evaluated
+    # point stands in rather than the lookup raising.
+    obj.modifiers.new("Sub", 'SUBSURF').levels = 2
+    bpy.context.view_layer.update()
+    snapping.invalidate()
+    got = snapping.snap(obj, Vector((0.3, 0.3, 10.0)), down, 'FACE', fallback)
+    assert got != fallback and abs(got.z - 1.0) < 0.2, tuple(got)
+
+
+def test_snapping_cache_survives_a_property_write():
+    """Writing a handle position fires the depsgraph handler once per mouse-move
+    event, and rebuilding there costs ~31 ms per 40k verts inside the drag."""
     from types import SimpleNamespace
 
-    from blender_toolkit.tools.weights import overlay
+    from blender_toolkit.tools.weights import overlay, snapping
 
-    built = snapping._tree_cache[0]
+    reset()
+    obj = _grid_with_key(subdivisions=4)
+    snapping.snap(
+        obj, Vector((0.3, 0.3, 10.0)), Vector((0.0, 0.0, -1.0)), 'FACE',
+        Vector((0.0, 0.0, 0.0)),
+    )
+    built = snapping._cache[0]
+    assert built is not None
+
     overlay._on_depsgraph(None, SimpleNamespace(
         updates=[SimpleNamespace(is_updated_geometry=False)]
     ))
-    assert snapping._tree_cache[0] == built, "kept when only a property changed"
+    assert snapping._cache[0] == built, "kept when only a property changed"
     overlay._on_depsgraph(None, SimpleNamespace(
         updates=[SimpleNamespace(is_updated_geometry=True)]
     ))
-    assert snapping._tree_cache[0] is None, "dropped when the mesh really moved"
-
-
-def test_snapping_follows_the_cursor():
-    """Snap to what the view ray hits, not to whatever is nearest in 3D.
-
-    A handle dragged past the surface is still under the cursor on the near
-    side; snapping by 3D proximity puts it on the far side of the mesh, which
-    is what made dragging feel wrong.
-    """
-    from types import SimpleNamespace
-
-    from mathutils import Matrix
-
-    from blender_toolkit.tools.weights import snapping
-
-    reset()
-    bpy.ops.mesh.primitive_uv_sphere_add(segments=32, ring_count=16, radius=1.0)
-    obj = bpy.context.active_object
-
-    # Front view: viewer at -Y looking towards +Y.
-    view = Matrix.Rotation(1.5707963, 4, 'X')
-    view.translation = (0.0, -10.0, 0.0)
-    region_data = SimpleNamespace(view_matrix=view.inverted(), is_perspective=True)
-
-    dragged = Vector((0.0, 3.0, 0.0))  # beyond the sphere, cursor still over it
-    for mode in ('FACE', 'VERTEX', 'EDGE'):
-        with_ray = snapping.snap(obj, dragged, mode, region_data)
-        nearest = snapping.snap(obj, dragged, mode, None)
-        assert with_ray.y < 0.0, (mode, tuple(with_ray))   # the near face
-        assert nearest.y > 0.0, (mode, tuple(nearest))     # what it used to do
-
-    # An orthographic view has no eye position; the ray still points the way.
-    ortho = SimpleNamespace(view_matrix=view.inverted(), is_perspective=False)
-    assert snapping.snap(obj, dragged, 'FACE', ortho).y < 0.0
-
-    # A ray that misses falls back rather than dropping the handle at the origin.
-    away = Vector((50.0, 3.0, 0.0))
-    assert snapping.snap(obj, away, 'FACE', region_data).length <= 1.0 + 1e-5
+    assert snapping._cache[0] is None, "dropped when the mesh really moved"
 
 
 def test_handles_follow_ramp_stops():
@@ -572,8 +590,7 @@ def test_handles_follow_ramp_stops():
 
     reset()
     obj = _grid_with_key()
-    settings = obj.tk_gradient
-    assert bpy.ops.tk.start_gradient(source='BOUNDS', axis='X') == {'FINISHED'}
+    settings = _add_gradient(obj)
     stops = properties.ramp_of(settings).elements
     assert len(settings.handles) == len(stops) == 2
     assert [h.weight for h in settings.handles] == [0.0, 1.0]
@@ -619,7 +636,7 @@ def test_handles_follow_ramp_stops():
     assert properties.sync_handles_to_ramp(settings) is True
     assert len(settings.handles) == 2
 
-    bpy.ops.tk.cancel_gradient()
+    _detach(obj)
 
 
 def test_ramp_edits_are_noticed():
@@ -628,8 +645,7 @@ def test_ramp_edits_are_noticed():
 
     reset()
     obj = _grid_with_key()
-    settings = obj.tk_gradient
-    assert bpy.ops.tk.start_gradient(source='BOUNDS', axis='X') == {'FINISHED'}
+    settings = _add_gradient(obj)
 
     properties.take_dirty()  # start leaves work pending; begin from a clean slate
     overlay._signature = properties.ramp_signature(settings)
@@ -646,68 +662,135 @@ def test_ramp_edits_are_noticed():
     group = obj.vertex_groups[settings.group_name]
     low = min(obj.data.vertices, key=lambda v: v.co.x)
     assert abs(group.weight(low.index) - 0.25) < 1e-5, group.weight(low.index)
-    bpy.ops.tk.cancel_gradient()
+    _detach(obj)
 
 
-def test_handle_setter_snaps_live():
-    """The gizmo's setter snaps as it writes, so a drag lands on the geometry.
+def test_handle_gizmo():
+    """The handle is a custom gizmo that owns its own drag.
 
-    The gizmo reads its position back through the getter, so what it draws is
-    the snapped point rather than the raw cursor - which is what keeps the disc
-    and the path the same point mid-drag.
+    `GIZMO_GT_move_3d` could not: it accumulates the drag into
+    `matrix_basis`/`matrix_offset`, both of which are added to whatever its
+    target reports, and it never re-reads the target while modal - so snapping
+    moved the data and not the disc. The modal cannot be driven headlessly (no
+    region, no events), so what is checked here is the wiring around it.
     """
-    from blender_toolkit.tools.weights import overlay
+    from blender_toolkit.tools.weights import overlay, properties
 
     reset()
     obj = _grid_with_key()
-    settings = obj.tk_gradient
-    assert bpy.ops.tk.start_gradient(source='BOUNDS', axis='X') == {'FINISHED'}
-    get, set = overlay._handle_accessors(0)
+    settings = _add_gradient(obj)
 
-    settings.snap = 'FREE'
-    set((0.3, 0.3, 5.0))
-    assert Vector(get()) == Vector((0.3, 0.3, 5.0)), "FREE stores it untouched"
+    # Gizmo groups are not exposed as bpy.types.<name>, and bl_rna survives
+    # unregister_class - this is the lookup that answers honestly.
+    assert bpy.types.Gizmo.bl_rna_get_subclass_py("TK_GT_gradient_handle") is not None
 
-    settings.snap = 'VERTEX'
-    set((0.3, 0.3, 5.0))
-    landed = Vector(get())
-    assert landed.z == 0.0 and any(
-        (v.co - landed).length < 1e-6 for v in obj.data.vertices
-    ), tuple(landed)
-    # What the gizmo draws and what the path is built from are one value.
-    assert Vector(settings.handles[0].position) == landed
+    verts = overlay._disc_shape_verts(segments=8)
+    assert len(verts) == 8 * 3, len(verts)
+    assert all(abs(Vector(v).length - 1.0) < 1e-6 for v in verts[1::3])
 
-    # A gizmo past the end of the handles must not raise.
-    overlay._handle_accessors(99)[1]((0.0, 0.0, 0.0))
-    assert overlay._handle_accessors(99)[0]() == [0.0, 0.0, 0.0]
+    # One gizmo per handle, and a spare pointing at nothing must not raise.
+    class _Fake:
+        pass
 
-    bpy.ops.tk.cancel_gradient()
+    fake = _Fake()
+    fake.index = 0
+    got_obj, handle = overlay._handle_of(fake)
+    assert got_obj is obj and tuple(handle.position) == tuple(
+        properties.active_gradient(obj).handles[0].position
+    )
+    fake.index = overlay.MAX_HANDLES
+    assert overlay._handle_of(fake) == (None, None)
+
+    _detach(obj)
 
 
-def test_cancel_resets_the_session():
-    """Cancel leaves no persisted state for the next session to inherit."""
+def test_painting_detaches_the_gradient():
+    """Painting on the group is the only exit, and it is also Apply.
+
+    The same bargain as Blender's redo panel, which closes the moment you do
+    anything else. The weights stay exactly as they stand - a gradient letting
+    go of them is no reason to lose them.
+    """
     from blender_toolkit.tools.weights import properties
 
     reset()
     obj = _grid_with_key()
-    settings = obj.tk_gradient
-    assert bpy.ops.tk.start_gradient(source='BOUNDS', axis='X') == {'FINISHED'}
+    settings = _add_gradient(obj)
+    name = settings.group_name
+    flush(obj)
+    group = obj.vertex_groups[name]
+    ramp = settings.ramp.name
 
-    properties.ramp_of(settings).elements.new(0.5)
-    properties.sync_handles_to_ramp(settings)
+    # Untouched, so nothing to react to: a rewrite must never detach itself.
+    assert properties.hand_painted(obj, settings) is False
     settings.invert = True
-    settings.curved = True
-    assert len(settings.handles) == 3
+    flush(obj)
+    assert properties.hand_painted(obj, settings) is False, (
+        "the gradient's own write is not a hand edit"
+    )
 
-    assert bpy.ops.tk.cancel_gradient() == {'FINISHED'}
-    assert len(properties.ramp_of(settings).elements) == 2
-    assert not settings.invert and not settings.curved
-    assert len(settings.handles) == 0  # reseeded on the next Start
+    painted = [group.weight(v.index) for v in obj.data.vertices]
+    group.add([0], 1.0 - painted[0], 'REPLACE')
+    painted[0] = 1.0 - painted[0]
+    assert properties.hand_painted(obj, settings) is True
 
-    # And the next session comes up with the default two handles.
-    assert bpy.ops.tk.start_gradient() == {'FINISHED'}
-    assert len(settings.handles) == 2
-    bpy.ops.tk.cancel_gradient()
+    properties.detach(obj, settings)
+    assert len(obj.tk_gradients) == 0
+    assert properties.active_gradient(obj) is None
+    assert name in obj.vertex_groups, "the weights are the work; they stay"
+    assert [
+        group.weight(v.index) for v in obj.data.vertices
+    ] == painted, "including the stroke that ended it"
+    assert ramp not in bpy.data.textures, "only the gradient's own data goes"
+
+
+def test_blend_composes_with_what_was_there():
+    """Adopting a group need not destroy it. The blend modes are Blender's own
+    Vertex Weight Mix names, against the weights the group had on adoption."""
+    from blender_toolkit.tools.weights import properties
+
+    reset()
+    obj = _grid_with_key()
+    prior = obj.vertex_groups.new(name="Mine")
+    for vert in obj.data.vertices:
+        prior.add([vert.index], 0.5, 'REPLACE')
+
+    settings = _add_gradient(obj)
+    assert settings.group_name == "Mine", "it adopts the active group"
+    flush(obj)
+
+    def weights():
+        return [prior.weight(v.index) for v in obj.data.vertices]
+
+    # The plain X ramp, which is what every mode composes with.
+    ramp = weights()
+
+    settings.blend = 'MAX'
+    flush(obj)
+    assert all(
+        abs(got - max(0.5, want)) < 1e-5 for got, want in zip(weights(), ramp)
+    )
+
+    settings.blend = 'MULTIPLY'
+    flush(obj)
+    assert all(
+        abs(got - 0.5 * want) < 1e-5 for got, want in zip(weights(), ramp)
+    )
+
+    settings.blend = 'ADD'
+    flush(obj)
+    assert all(
+        abs(got - min(0.5 + want, 1.0)) < 1e-5 for got, want in zip(weights(), ramp)
+    )
+
+    # Back to Replace and the originals are still there to compose with, which
+    # is what makes the choice reversible without a Remove button.
+    settings.blend = 'MIN'
+    flush(obj)
+    assert all(
+        abs(got - min(0.5, want)) < 1e-5 for got, want in zip(weights(), ramp)
+    )
+    _detach(obj)
 
 
 def test_handle_arc_positions():
@@ -822,8 +905,7 @@ def test_ramp_values():
 
     reset()
     obj = _grid_with_key()
-    settings = obj.tk_gradient
-    assert bpy.ops.tk.start_gradient(source='BOUNDS', axis='X') == {'FINISHED'}
+    settings = _add_gradient(obj)
     ramp = properties.ramp_of(settings)
     assert len(ramp.elements) == 2
     # The bar's ends are weight zero and weight one.
@@ -860,7 +942,7 @@ def test_ramp_values():
         flipped = gradient.factor(co, path, curve=curve, invert=True)
         assert abs(straight + flipped - 1.0) < 1e-6, co
 
-    bpy.ops.tk.cancel_gradient()
+    _detach(obj)
 
 
 def test_ramp_is_a_weight_scale():
@@ -869,7 +951,7 @@ def test_ramp_is_a_weight_scale():
 
     reset()
     obj = _grid_with_key()
-    settings = obj.tk_gradient
+    settings = obj.tk_gradients.add()
     ramp = properties.ensure_ramp(settings).color_ramp
 
     # A stop's colour is the scale's colour at its position, whatever was
@@ -940,113 +1022,214 @@ def test_gradient_mask():
         assert abs(a + b - 1.0) < 1e-5, (a, b)
 
 
-def test_gradient_session():
-    from blender_toolkit.tools.weights import overlay
+def test_gradient_is_an_attribute_of_a_group():
+    """One list, Blender's. Selecting a vertex group selects its gradient."""
+    from blender_toolkit.tools.weights import overlay, properties
 
     reset()
     obj = _grid_with_key()
-    settings = obj.tk_gradient
+    settings = _add_gradient(obj)
+    first = settings.group_name
 
-    assert bpy.ops.tk.start_gradient(source='BOUNDS', axis='X') == {'FINISHED'}
-    assert settings.active
-    assert obj.mode == 'WEIGHT_PAINT'
+    assert len(obj.tk_gradients) == 1
+    assert obj.vertex_groups.active.name == first, "the group follows the gradient"
+    # `==` not `is`: every read of a collection element is a fresh wrapper.
+    assert properties.active_gradient(obj) == settings
     assert overlay._handler is not None
-    assert settings.previous_mode == 'OBJECT'
-    def weights():  # the name is chosen by auto-naming, so read it back
-        group = obj.vertex_groups[settings.group_name]
+    assert obj.mode == 'WEIGHT_PAINT'
+
+    def weights(name):
+        group = obj.vertex_groups[name]
         return [group.weight(v.index) for v in obj.data.vertices]
 
-    before = weights()
-
-    # A setting change rewrites the weights, one beat later.
+    before = weights(first)
     settings.invert = True
     flush(obj)
-    assert all(abs(a + b - 1.0) < 1e-5 for a, b in zip(before, weights()))
+    assert all(abs(a + b - 1.0) < 1e-5 for a, b in zip(before, weights(first)))
 
-    created = settings.group_name
-    assert bpy.ops.tk.cancel_gradient() == {'FINISHED'}
-    assert not settings.active
-    assert overlay._handler is None
-    assert obj.mode == 'OBJECT'
-    assert created not in obj.vertex_groups  # Cancel removes what it created
+    # A second group with no gradient: the panel would offer Add, and
+    # active_gradient says there is nothing to edit.
+    plain = obj.vertex_groups.new(name="Plain")
+    assert properties.active_gradient(obj) is None
+    assert properties.gradient_for(obj, first) == settings
 
-    # Add keeps the weights and moves on to the next group by itself: no
-    # renaming step to know about, and the next one starts from defaults.
-    assert bpy.ops.tk.start_gradient(source='BOUNDS', axis='Y') == {'FINISHED'}
-    first = settings.group_name
-    kept = weights()
-    span = [tuple(h.position) for h in settings.handles]
-    assert bpy.ops.tk.add_gradient() == {'FINISHED'}
-    assert settings.active, "Add must not end the session"
-    assert obj.mode == 'WEIGHT_PAINT'
-    assert [
-        obj.vertex_groups[first].weight(v.index) for v in obj.data.vertices
-    ] == kept
-    assert settings.group_name != first, "Add advances to the next group"
-    assert settings.group_name not in obj.vertex_groups
-    assert settings.invert is False, "the next gradient starts from defaults"
-    assert [tuple(h.position) for h in settings.handles] == span, "path stays put"
-    assert settings.added_names == first
+    # Adding one there copies the last gradient made - the reason for a second
+    # is nearly always the first again with one thing changed.
+    second = _add_gradient(obj, source='KEEP')
+    assert second.group_name == "Plain"
+    assert second != settings and len(obj.tk_gradients) == 2
+    assert second.invert is True
+    assert [tuple(h.position) for h in second.handles] == [
+        tuple(h.position) for h in settings.handles
+    ]
 
-    # A second group without leaving, inverted so the pair adds to 1. Finish
-    # keeps it and closes, where Cancel would have thrown it away.
-    settings.group_name = "Second"
-    settings.invert = True
-    assert bpy.ops.tk.finish_gradient() == {'FINISHED'}
-    assert not settings.active
-    assert obj.mode == 'OBJECT'
-    assert {first, "Second"} <= {g.name for g in obj.vertex_groups}
+    # A group cannot carry two gradients: with one on the active group the
+    # operator will not run at all.
+    assert bpy.ops.tk.add_gradient.poll() is False
+
+    # Flip it back and the pair adds to 1 everywhere, both still editable.
+    second.invert = False
+    flush(obj)
     for vert in obj.data.vertices:
         a = obj.vertex_groups[first].weight(vert.index)
-        b = obj.vertex_groups["Second"].weight(vert.index)
+        b = obj.vertex_groups["Plain"].weight(vert.index)
         assert abs(a + b - 1.0) < 1e-5, (a, b)
 
+    # Selecting the first group again is what goes back to the first gradient.
+    obj.vertex_groups.active = obj.vertex_groups[first]
+    assert properties.active_gradient(obj) == settings
 
-def test_session_backup_round_trips_membership():
-    """The way back is data on the object, and it restores non-membership too.
+    # Selecting a group with no gradient leaves nothing to draw, and the write
+    # engine stays up either way - it runs for the add-on's lifetime.
+    obj.vertex_groups.active = obj.vertex_groups.new(name="No gradient")
+    assert properties.showing(obj) is False
+    assert overlay._handler is not None
 
-    A dict keyed on the object name does not survive undo, a save or a rename;
-    a backup group does. It has to mirror membership exactly, or a vertex that
-    was outside the group comes back as a member weighing zero.
+    for name in (first, "Plain"):
+        obj.vertex_groups.active = obj.vertex_groups[name]
+        _detach(obj)
+
+
+def test_rename_is_followed_and_deletion_is_not():
+    """Blender gives add-ons no rename hook, so a rename can only be inferred.
+
+    The evidence is the group count holding still while a name disappears.
+    Deleting a group moves the count, so that falls through to a purge rather
+    than adopting whichever group shuffled into the gap.
     """
     from blender_toolkit.tools.weights import properties
 
     reset()
     obj = _grid_with_key()
-    settings = obj.tk_gradient
+    settings = _add_gradient(obj)
+    flush(obj)
 
-    # Half the vertices in the group, the rest deliberately not members.
+    # Renamed in Blender's own list, which is the obvious thing to do.
+    obj.vertex_groups[settings.group_name].name = "Renamed by hand"
+    assert properties.purge_orphans(obj) is True
+    assert len(obj.tk_gradients) == 1, "the rename is followed, not punished"
+    settings = properties.active_gradient(obj)
+    assert settings.group_name == "Renamed by hand"
+    assert settings.name == "Renamed by hand"
+    flush(obj)  # and it still writes, under the new name
+    assert obj.vertex_groups["Renamed by hand"].weight(0) is not None
+
+    # Nothing to do is not a change.
+    assert properties.purge_orphans(obj) is False
+
+    # When the snapshot is stale - a group added and a rename inside the same
+    # poll - the count no longer matches and a rename cannot be told from a
+    # deletion. Purge, and Ctrl+Z is the way back; it must never adopt the wrong
+    # group. In practice the timer refreshes the snapshot every 150 ms, so this
+    # is the rare case rather than the usual one.
+    ramp = settings.ramp.name
+    obj.vertex_groups.new(name="Unrelated")
+    obj.vertex_groups["Renamed by hand"].name = "Renamed twice"
+    assert properties.purge_orphans(obj) is True
+    assert len(obj.tk_gradients) == 0
+    assert ramp not in bpy.data.textures, "the ramp goes with it"
+    assert "Renamed twice" in obj.vertex_groups, "the weights are left alone"
+
+
+def test_deleting_a_group_purges_its_gradient():
+    """The group is gone, so there is nothing for the gradient to write."""
+    from blender_toolkit.tools.weights import properties
+
+    reset()
+    obj = _grid_with_key()
+    settings = _add_gradient(obj)
+    flush(obj)
+    ramp = settings.ramp.name
+
+    obj.vertex_groups.remove(obj.vertex_groups[settings.group_name])
+    assert properties.purge_orphans(obj) is True
+    assert len(obj.tk_gradients) == 0
+    assert ramp not in bpy.data.textures
+    assert not obj.vertex_groups
+
+
+def test_locked_groups_are_left_alone():
+    """`lock_weight` stops Blender's paint tools, not the API - group.add()
+    writes straight through it. The one thing writing every 150 ms has to check
+    it, or the lock in the list means nothing."""
+    from blender_toolkit.tools.weights import properties
+
+    reset()
+    obj = _grid_with_key()
+    settings = _add_gradient(obj)
+    flush(obj)
+    group = obj.vertex_groups[settings.group_name]
+    frozen = [group.weight(v.index) for v in obj.data.vertices]
+
+    group.lock_weight = True
+    settings.invert = True
+    flush(obj)
+    assert [
+        group.weight(v.index) for v in obj.data.vertices
+    ] == frozen, "a locked group must not be rewritten"
+
+    # Unlocking lets the pending change through on the next beat.
+    group.lock_weight = False
+    properties.mark_dirty()
+    flush(obj)
+    assert all(
+        abs(a + b - 1.0) < 1e-5
+        for a, b in zip(frozen, (group.weight(v.index) for v in obj.data.vertices))
+    )
+
+    # And a gradient cannot be added to a locked group at all.
+    _detach(obj)
+    locked = obj.vertex_groups.new(name="Locked")
+    locked.lock_weight = True
+    raises(bpy.ops.tk.add_gradient, "is locked", source='BOUNDS', axis='X')
+    assert len(obj.tk_gradients) == 0
+
+
+def test_mask_baseline_round_trips_membership():
+    """The backup group exists for the mask, and mirrors membership exactly.
+
+    A masked write blends towards what the group held before the gradient
+    adopted it - which cannot be read off the group once the gradient has
+    started overwriting it. A vertex that was outside the group has to come
+    back as a non-member, not as a member weighing zero.
+    """
+    from blender_toolkit.tools.weights import properties
+
+    reset()
+    obj = _grid_with_key()
+
+    mask = obj.vertex_groups.new(name="Nowhere")  # empty: masks everything out
+
+    # Half the vertices in the group, the rest deliberately not members. Made
+    # last, so it is the active group the new gradient adopts.
     prior = obj.vertex_groups.new(name="Partial")
     inside = [v.index for v in obj.data.vertices if v.co.x > 0]
     for index in inside:
         prior.add([index], 0.3, 'REPLACE')
 
-    assert bpy.ops.tk.start_gradient(source='BOUNDS', axis='X') == {'FINISHED'}
-    settings.group_name = "Partial"
+    settings = _add_gradient(obj)
+    assert settings.group_name == "Partial", "the active group is what it adopts"
+    settings.mask_group = "Nowhere"
     flush(obj)
-    assert properties.BACKUP_PREFIX + "Partial" in obj.vertex_groups
-    assert obj[properties.SESSION_KEY]["Partial"] == "borrowed"
 
-    assert bpy.ops.tk.cancel_gradient() == {'FINISHED'}
-    members = {
-        v.index: {g.group: g.weight for g in v.groups} for v in obj.data.vertices
-    }
-    assert [i for i, w in members.items() if prior.index in w] == inside
-    assert all(abs(members[i][prior.index] - 0.3) < 1e-6 for i in inside)
+    saved = properties.baseline_of(settings, len(obj.data.vertices))
+    assert [
+        i for i, w in enumerate(saved) if w != properties.NOT_A_MEMBER
+    ] == inside
+    assert all(abs(saved[i] - 0.3) < 1e-6 for i in inside)
+    # It lives on the gradient, not as a vertex group the user has to look at.
+    assert not [g for g in obj.vertex_groups if g.name.startswith("tk.")]
 
-    # Nothing of the session's own is left lying about.
-    assert not [g for g in obj.vertex_groups if g.name.startswith(properties.BACKUP_PREFIX)]
-    assert properties.SESSION_KEY not in obj
+    # Fully masked out, so every vertex keeps what it had - including the
+    # non-members, which read as zero rather than as 0.3.
+    assert all(
+        abs(prior.weight(i) - 0.3) < 1e-6 for i in inside
+    ), "a fully masked write must leave the group alone"
 
-    # Add commits instead, and clears the way back just the same.
-    assert bpy.ops.tk.start_gradient(source='BOUNDS', axis='X') == {'FINISHED'}
-    settings.group_name = "Partial"
-    flush(obj)
-    assert bpy.ops.tk.add_gradient() == {'FINISHED'}
-    assert properties.SESSION_KEY not in obj
-    assert not [g for g in obj.vertex_groups if g.name.startswith(properties.BACKUP_PREFIX)]
-    assert any(prior.weight(i) != 0.3 for i in inside), "the write must stand"
-    bpy.ops.tk.cancel_gradient()
+    # The claim goes when the gradient does.
+    _detach(obj)
+    assert "Partial" in obj.vertex_groups
+    obj.vertex_groups.remove(mask)
 
 
 def test_factor_cache_matches_the_long_way_round():
@@ -1056,8 +1239,7 @@ def test_factor_cache_matches_the_long_way_round():
 
     reset()
     obj = _grid_with_key()
-    settings = obj.tk_gradient
-    assert bpy.ops.tk.start_gradient(source='BOUNDS', axis='X') == {'FINISHED'}
+    settings = _add_gradient(obj)
 
     def uncached():
         points = properties.path_of(settings)
@@ -1080,51 +1262,7 @@ def test_factor_cache_matches_the_long_way_round():
             settings.shape, settings.curved
         )
 
-    bpy.ops.tk.cancel_gradient()
-
-
-def test_record_formats_still_load():
-    """Three handle shapes have been written; all three must still mean it."""
-    from blender_toolkit.tools.weights import properties
-
-    reset()
-    obj = _grid_with_key()
-    settings = obj.tk_gradient
-    assert bpy.ops.tk.start_gradient(source='BOUNDS', axis='X') == {'FINISHED'}
-
-    base = {key: getattr(settings, key) for key in properties.RECORDED}
-    positions = [(-1.0, 0.0, 0.0), (0.0, 0.5, 0.0), (1.0, 0.0, 0.0)]
-
-    # Current: weight first, then the position.
-    obj[properties.RECORD_KEY] = {"Now": {
-        **base, "handles": [[w, *p] for w, p in zip((0.0, 0.4, 1.0), positions)],
-    }}
-    assert properties.load_record(obj, settings, "Now") is True
-    assert [round(h.weight, 3) for h in settings.handles] == [0.0, 0.4, 1.0]
-
-    # Previous: t first, weights in a separate "stops" list.
-    obj[properties.RECORD_KEY] = {"Then": {
-        **base,
-        "handles": [[t, *p] for t, p in zip((0.0, 0.5, 1.0), positions)],
-        "stops": [[0.0, 0.0], [0.5, 0.3], [1.0, 1.0]],
-    }}
-    assert properties.load_record(obj, settings, "Then") is True
-    assert [round(h.weight, 3) for h in settings.handles] == [0.0, 0.3, 1.0]
-
-    # Oldest: bare positions, no weight stored at all - spread them evenly.
-    obj[properties.RECORD_KEY] = {"Oldest": {
-        **base, "handles": [list(p) for p in positions],
-    }}
-    assert properties.load_record(obj, settings, "Oldest") is True
-    assert [round(h.weight, 3) for h in settings.handles] == [0.0, 0.5, 1.0]
-
-    # Every one of them leaves the ramp matching the handles it loaded.
-    stops = sorted(e.position for e in properties.ramp_of(settings).elements)
-    assert [round(x, 3) for x in stops] == [0.0, 0.5, 1.0]
-    assert [tuple(round(c, 3) for c in h.position) for h in settings.handles] == [
-        tuple(round(c, 3) for c in p) for p in positions
-    ]
-    bpy.ops.tk.cancel_gradient()
+    _detach(obj)
 
 
 def test_invert_negates_and_moves_the_stops():
@@ -1137,8 +1275,7 @@ def test_invert_negates_and_moves_the_stops():
 
     reset()
     obj = _grid_with_key()
-    settings = obj.tk_gradient
-    assert bpy.ops.tk.start_gradient(source='BOUNDS', axis='X') == {'FINISHED'}
+    settings = _add_gradient(obj)
 
     # Three handles with a deliberately lopsided profile, so mirroring the
     # position and negating the weight cannot be confused for each other.
@@ -1189,24 +1326,25 @@ def test_invert_negates_and_moves_the_stops():
             for v in obj.data.vertices
         ))
     )
-    bpy.ops.tk.cancel_gradient()
+    _detach(obj)
 
 
 def test_gradient_rename_moves_the_group():
-    """Renaming mid-session moves the gradient; it does not leave a copy."""
+    """Re-aiming a gradient takes its output with it, and leaves no orphan."""
     reset()
     obj = _grid_with_key()
-    settings = obj.tk_gradient
+    settings = _add_gradient(obj)
 
-    assert bpy.ops.tk.start_gradient(source='BOUNDS', axis='X') == {'FINISHED'}
     created = settings.group_name
     settings.group_name = "Renamed"
     flush(obj)
-    assert created not in obj.vertex_groups, "the old name must not linger"
+    assert created not in obj.vertex_groups, "a group it created must not linger"
     assert "Renamed" in obj.vertex_groups
     assert obj.vertex_groups.active.name == "Renamed"
 
-    # Naming an existing group borrows it; naming away again hands it back.
+    # A group that was already there stays when the gradient moves off it -
+    # with the gradient's weights in it, because nothing was ever promised
+    # otherwise. Ctrl+Z is the way back, not a hidden rollback.
     prior = obj.vertex_groups.new(name="Keep")
     for vert in obj.data.vertices:
         prior.add([vert.index], 0.25, 'REPLACE')
@@ -1215,28 +1353,26 @@ def test_gradient_rename_moves_the_group():
     assert any(prior.weight(v.index) != 0.25 for v in obj.data.vertices)
     settings.group_name = "Elsewhere"
     flush(obj)
-    assert all(
-        abs(prior.weight(v.index) - 0.25) < 1e-6 for v in obj.data.vertices
-    ), "a group the session only borrowed must come back untouched"
+    assert "Keep" in obj.vertex_groups
 
-    bpy.ops.tk.cancel_gradient()
+    _detach(obj)
 
 
 def test_gradient_mask_edge_does_not_erode():
-    """A rewrite blends against the pre-session weights, not its own last result.
+    """A rewrite blends against the group's baseline, not its own last result.
 
     Blending against the group as it stands walks a half-masked vertex towards
     the full gradient one property tweak at a time.
     """
     reset()
     obj = _grid_with_key()
-    settings = obj.tk_gradient
 
     half = obj.vertex_groups.new(name="Half")
     for vert in obj.data.vertices:
         half.add([vert.index], 0.5, 'REPLACE')
 
-    assert bpy.ops.tk.start_gradient(source='BOUNDS', axis='X') == {'FINISHED'}
+    settings = _add_gradient(obj)
+    settings.group_name = "Result"  # not the mask: a gradient owns its group
     settings.mask_group = "Half"
     flush(obj)
 
@@ -1252,17 +1388,16 @@ def test_gradient_mask_edge_does_not_erode():
         flush(obj)
     assert all(abs(a - b) < 1e-6 for a, b in zip(first, weights()))
 
-    bpy.ops.tk.cancel_gradient()
+    _detach(obj)
 
 
-def test_distribute_evenly_and_reset_for_next():
-    """The button that replaces the old ramp toggle, and what Add keeps."""
+def test_distribute_evenly():
+    """Spreading the stops evenly is the way back after hand-editing them."""
     from blender_toolkit.tools.weights import properties
 
     reset()
     obj = _grid_with_key()
-    settings = obj.tk_gradient
-    assert bpy.ops.tk.start_gradient(source='BOUNDS', axis='X') == {'FINISHED'}
+    settings = _add_gradient(obj)
 
     ramp = properties.ramp_of(settings)
     for position in (0.2, 0.3, 0.4):
@@ -1274,31 +1409,102 @@ def test_distribute_evenly_and_reset_for_next():
     # the stops to where those weights now read on the bar.
     even = [0.0, 0.25, 0.5, 0.75, 1.0]
     for settings.invert in (False, True):
-        assert bpy.ops.tk.distribute_handle_weights() == {'FINISHED'}
+        assert bpy.ops.tk.distribute_handles(mode='WEIGHTS') == {'FINISHED'}
         assert [round(h.weight, 6) for h in settings.handles] == even
         assert [round(e.position, 6) for e in ramp.elements] == even
 
-    # Add keeps the ends of the path and drops everything else back to default.
-    ends = [tuple(settings.handles[i].position) for i in (0, -1)]
-    settings.smooth_repeat = 3
-    assert bpy.ops.tk.add_gradient() == {'FINISHED'}
-    assert [tuple(h.position) for h in settings.handles] == ends
-    assert [h.weight for h in settings.handles] == [0.0, 1.0]
-    assert settings.smooth_repeat == 0 and settings.invert is False
-    assert len(properties.ramp_of(settings).elements) == 2
-
-    bpy.ops.tk.cancel_gradient()
+    _detach(obj)
 
 
-def test_gradient_record_round_trip():
-    """Add saves the gradient onto the group; naming it again picks it back up."""
+def test_spaced_and_relaxed_positions():
+    """Two different operations, and neither is the other.
+
+    Spacing respaces the handles along the path they already describe; relaxing
+    pulls each towards its neighbours' midpoint, which shortens the path. Pure
+    maths, so tested without an operator.
+    """
+    from blender_toolkit.tools.weights import gradient
+
+    # Four handles on a straight run, three of them bunched at one end.
+    bunched = [(0.0, 0.0, 0.0), (0.1, 0.0, 0.0), (0.2, 0.0, 0.0), (3.0, 0.0, 0.0)]
+    spaced = gradient.spaced_positions(bunched)
+    assert spaced[0] == bunched[0] and spaced[-1] == bunched[-1], "ends pinned"
+    gaps = [
+        gradient._length(gradient._sub(b, a)) for a, b in zip(spaced, spaced[1:])
+    ]
+    assert max(gaps) - min(gaps) < 1e-9, gaps
+    # Idempotent on a straight path: already even, so nothing moves.
+    assert all(
+        gradient._length(gradient._sub(a, b)) < 1e-9
+        for a, b in zip(spaced, gradient.spaced_positions(spaced))
+    )
+
+    # A kink, off the chord. Relaxing pulls it in; spacing leaves it there.
+    kinked = [(0.0, 0.0, 0.0), (1.0, 1.0, 0.0), (2.0, 0.0, 0.0)]
+    assert gradient.relax_positions(kinked, factor=0.5)[1] == (1.0, 0.5, 0.0)
+    assert gradient.spaced_positions(kinked)[1][1] == 1.0, "spacing keeps the kink"
+
+    # Repeating walks it towards the chord, and the ends never move.
+    far = gradient.relax_positions(kinked, factor=0.5, repeat=8)
+    assert far[0] == kinked[0] and far[-1] == kinked[-1]
+    assert 0.0 < far[1][1] < 0.01, far[1]
+
+    # Too few handles to have an interior: both are identities.
+    for pair in ([(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)], [(0.0, 0.0, 0.0)]):
+        assert gradient.spaced_positions(pair) == pair
+        assert gradient.relax_positions(pair) == pair
+
+    # Every handle in one place, as happens mid-drag: no division by zero.
+    stacked = [(1.0, 1.0, 1.0)] * 3
+    assert gradient.spaced_positions(stacked) == stacked
+
+
+def test_distribute_handles_modes():
+    """Weights and positions move independently, from one operator."""
     from blender_toolkit.tools.weights import properties
 
     reset()
     obj = _grid_with_key()
-    settings = obj.tk_gradient
+    settings = _add_gradient(obj)
+    properties.ramp_of(settings).elements.new(0.5)
+    properties.sync_handles_to_ramp(settings)
+    assert len(settings.handles) == 3
 
-    assert bpy.ops.tk.start_gradient(source='BOUNDS', axis='X') == {'FINISHED'}
+    settings.handles[1].position = (0.9, 0.0, 0.0)  # bunched towards the end
+    weights = [h.weight for h in settings.handles]
+
+    assert bpy.ops.tk.distribute_handles(mode='POSITIONS') == {'FINISHED'}
+    assert abs(settings.handles[1].position.x) < 1e-6, "midway between the ends"
+    assert [h.weight for h in settings.handles] == weights, "weights untouched"
+
+    # Relax moves an off-axis handle towards its neighbours' midpoint.
+    settings.handles[1].position = (0.0, 1.0, 0.0)
+    assert bpy.ops.tk.distribute_handles(mode='RELAX', factor=0.5) == {'FINISHED'}
+    assert abs(settings.handles[1].position.y - 0.5) < 1e-6
+    assert [h.weight for h in settings.handles] == weights
+
+    # And weights mode moves no handle.
+    settings.handles[1].weight = 0.9
+    positions = [tuple(h.position) for h in settings.handles]
+    assert bpy.ops.tk.distribute_handles(mode='WEIGHTS') == {'FINISHED'}
+    assert [round(h.weight, 6) for h in settings.handles] == [0.0, 0.5, 1.0]
+    assert [tuple(h.position) for h in settings.handles] == positions
+
+    _detach(obj)
+
+
+def test_gradients_stay_editable():
+    """The whole point of the list: come back to a gradient and adjust it.
+
+    The old flow saved a record keyed on the group name and could only get back
+    in through a search field. A row you click is the same thing without the
+    ritual - and without a record format to migrate.
+    """
+    from blender_toolkit.tools.weights import properties
+
+    reset()
+    obj = _grid_with_key()
+    settings = _add_gradient(obj)
     settings.group_name = "Saved"
     settings.shape = 'SPHERICAL'
     settings.smooth_repeat = 2
@@ -1306,41 +1512,27 @@ def test_gradient_record_round_trip():
     settings.handles[0].position = (-0.5, 0.25, 0.0)
     flush(obj)
     path = [tuple(round(c, 5) for c in h.position) for h in settings.handles]
-    assert bpy.ops.tk.add_gradient() == {'FINISHED'}
-    assert "Saved" in obj[properties.RECORD_KEY]
 
-    # Move on to an unrelated group, then come back to the saved one.
-    settings.group_name = "Other"
-    settings.shape = 'LINEAR'
-    settings.curved = False
-    settings.smooth_repeat = 0
-    settings.group_name = "Saved"
+    # A second gradient on its own group, edited to something else entirely.
+    obj.vertex_groups.new(name="Other")
+    other = _add_gradient(obj, source='KEEP')
+    assert other.group_name == "Other"
+    other.shape = 'LINEAR'
+    other.curved = False
+    flush(obj)
+
+    # Selecting the first group again: it is exactly as it was left.
+    obj.vertex_groups.active = obj.vertex_groups["Saved"]
+    settings = properties.active_gradient(obj)
+    assert settings.group_name == "Saved"
     assert settings.shape == 'SPHERICAL'
     assert settings.curved
     assert settings.smooth_repeat == 2
     assert [tuple(round(c, 5) for c in h.position) for h in settings.handles] == path
 
-    bpy.ops.tk.cancel_gradient()
-
-    # A fresh session starts clean - defaults and an unused name - rather than
-    # inheriting the last round or resuming whatever it was last pointed at.
-    assert bpy.ops.tk.start_gradient(source='BOUNDS', axis='Y') == {'FINISHED'}
-    assert settings.shape == 'LINEAR'
-    assert not settings.curved
-    assert settings.smooth_repeat == 0
-    assert settings.group_name not in {"Saved", "Other"}
-    assert "Saved" in obj.vertex_groups, "the committed group must be left alone"
-    assert properties.unused_group_name(obj) != settings.group_name, (
-        "the session took the name, so the next free one has to differ"
-    )
-
-    # Picking the saved group in the panel is what resumes it.
-    settings.group_name = "Saved"
-    assert settings.shape == 'SPHERICAL'
-    assert [tuple(round(c, 5) for c in h.position) for h in settings.handles] == path
-    assert properties.has_record(obj, "Saved")
-    bpy.ops.tk.cancel_gradient()
-    assert settings.shape == 'LINEAR', "Cancel leaves nothing behind either"
+    for name in ("Saved", "Other"):
+        obj.vertex_groups.active = obj.vertex_groups[name]
+        _detach(obj)
 
 
 def test_overlay_draws():
@@ -1352,9 +1544,7 @@ def test_overlay_draws():
     gpu.init()  # background Blender has no GPU context until this is called
     reset()
     obj = _grid_with_key()
-    settings = obj.tk_gradient
-    settings.start, settings.end = (-1, 0, 0), (1, 0, 0)
-    settings.active = True
+    settings = _add_gradient(obj)
     try:
         for shape in ('LINEAR', 'SPHERICAL', 'BAND'):
             settings.shape = shape
@@ -1365,12 +1555,14 @@ def test_overlay_draws():
         for vert in obj.data.vertices:
             mask.add([vert.index], 1.0 if vert.co.x > 0 else 0.0, 'REPLACE')
         settings.mask_group = "Protect"
+        # Making the mask group moved the active selection onto it, and the
+        # active group is what picks a gradient - put it back.
+        obj.vertex_groups.active = obj.vertex_groups[settings.group_name]
         overlay._draw()
         assert overlay._mask_cache[1] is not None
         assert overlay._mask_shader is not None
     finally:
-        settings.active = False
-        settings.mask_group = ""
+        _detach(obj)
     assert overlay._shader is not None
 
 
@@ -1424,9 +1616,8 @@ def test_gradient_seeds_without_a_selection():
         expected = (vert.co.x + 1.0) / 2.0
         assert abs(obj.vertex_groups["A"].weight(vert.index) - expected) < 1e-5
 
-    # A session started cold gets the same treatment.
-    settings = obj.tk_gradient
-    assert bpy.ops.tk.start_gradient() == {'FINISHED'}
+    # A gradient added cold gets the same treatment.
+    settings = _add_gradient(obj, source='AUTO')
     assert [tuple(round(c, 3) for c in h.position) for h in settings.handles] == [
         (-1.0, 0.0, 0.0), (1.0, 0.0, 0.0)
     ]
@@ -1435,7 +1626,7 @@ def test_gradient_seeds_without_a_selection():
     # shape key offset in Z, which moves the evaluated bounding box away from
     # the base coordinates the weights are computed from.
     assert all(abs(h.position.z) < 1e-6 for h in settings.handles)
-    bpy.ops.tk.cancel_gradient()
+    _detach(obj)
 
     # A flat mesh has no Z extent, so asking for Z must not produce a
     # zero-length gradient - it falls back to the longest axis.

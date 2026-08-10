@@ -105,7 +105,7 @@ on the second pass to drop the intermediates.
 ### Weights
 
 ![Weight gradient handles in the viewport](docs/images/weights.png)
-<!-- screenshot placeholder: handles + gradient ramp mid-session -->
+<!-- screenshot placeholder: vertex group list, handles + ramp -->
 
 **Weight Gradient** builds vertex-group weights from a spatial falloff between
 two points: **start** reads 0, **end** reads 1. It writes a plain vertex group,
@@ -115,65 +115,99 @@ blends — anything that takes a group.
 The points are arbitrary positions, so the gradient runs in any direction; a
 tilted plane is just a start and end that aren't axis-aligned.
 
-#### Interactive session
+#### A gradient is an attribute of a vertex group
 
-One button, **Weight Gradient**, opens a live session. It remembers your current
-mode, drops you into Weight Paint, and draws the path in the viewport as
-draggable handles. Every change in the panel rewrites the weights — drag a
-handle, edit the ramp, switch shape — with no re-running and no undo spam.
+There is one list, and it is Blender's own — **Properties ▸ Object Data ▸ Vertex
+Groups**. The Toolkit panel doesn't copy it; it works on whichever group is
+active there and names it at the top. **Selecting a vertex group is selecting a
+gradient.** A group either has one or it doesn't, and the panel shows either its
+settings or an **Add Gradient** button.
 
-Writes are batched rather than done per event: a drag fires an update on every
-mouse-move, so the session collects them and writes at most once every 150 ms.
-On a 65k-vertex mesh, moving a handle rebuilds the falloff in 150–500 ms
-depending on how many handles there are; anything else — the ramp, the profile,
-the mask, the group name — reuses the cached field and costs about 110 ms
-regardless.
+Selecting a group that has a gradient puts its path in the viewport as draggable
+discs — there is no mode to enter and nothing to switch on. Adding a gradient
+drops you into Weight Paint, because that is where the weights it writes are
+visible.
 
-| Button | What it does |
+The settings sit in two collapsible sections: **Falloff** is the shape of the
+field, **Weights** is the ramp and what the weights do along the path. The ramp
+is the only weight editor — its `+` / `−` add and remove handles, and its `Pos`
+field is where an exact weight is typed.
+
+Every change rewrites the weights — drag a handle, edit the ramp, switch shape —
+with no re-running. Writes are batched rather than done per event: a drag fires
+an update on every mouse-move, so they are collected and written at most once
+every 150 ms. On a 65k-vertex mesh, moving a handle rebuilds the falloff in
+150–500 ms depending on how many handles there are; anything else — the ramp,
+the profile, the mask, the group name — reuses the cached field and costs about
+110 ms regardless.
+
+**Add Gradient** is the only button. It generates the active vertex group's
+weights, or makes a group if none is selected. A new gradient starts as a copy
+of the last one you added — the reason for a second is nearly always the first
+again with one thing changed, so tick **Invert** and you have the complementary
+pair.
+
+#### Painting is how a gradient ends
+
+A gradient regenerates its group on every change, so while it is live your brush
+strokes would be overwritten. Rather than forbid that, **painting on the group
+detaches the gradient**: the weights stay exactly as they stand, stroke
+included, and the group becomes ordinary weights. There is no Apply button
+because painting *is* Apply, and no Remove button because painting is that too.
+
+That is the same bargain as Blender's redo panel, which closes the moment you do
+anything else. Ctrl+Z is the way back.
+
+The detach is confirmed, not guessed — a posed armature, a shape key slider and
+a modifier tweak all update the mesh too, and none of them should end a
+gradient. The add-on compares the group against what it actually wrote.
+
+If you want to protect a region *while* the gradient is live, that is what
+**Mask** is for.
+
+#### Adopting a group that already has weights
+
+Pointing a gradient at a group that already has weights doesn't have to destroy
+them. **Blend** decides what the gradient does to them:
+
+| Mode | Result |
 | --- | --- |
-| **Add** | Keeps the current group and moves straight on to the next one: the gradient resets to defaults and the name advances to one nothing is using. The path stays where you dragged it — its two ends, at least, since the ramp goes back to two stops. |
-| **Finish** | Keeps the current group and ends the session, back to your original mode. |
-| **Cancel** | Ends the session and throws away the gradient in progress, including deleting a group the session created. Anything you already hit Add or Finish on is kept. |
+| **Replace** | The gradient's weight, ignoring what was there. The default. |
+| **Add** | The two summed, clamped to 1. |
+| **Multiply** | What was there, scaled by the gradient. |
+| **Minimum** / **Maximum** | The lower or higher of the two. |
 
-**Every session opens clean** — defaults, and a group name nothing is using yet.
-Last round's shape, mask and ramp are not what you want on the next group, so
-none of it carries over. **Add** opens clean the same way, minus the handles:
-the next group almost always runs over the same span, and re-placing the path is
-the part that took the work. Sessions live on the **object**, so two meshes in a
-file each keep their own.
+Same set and same names as Blender's **Vertex Weight Mix** modifier. The blend
+is always against the weights the group had *when the gradient adopted it*, not
+against the gradient's own last result — so changing mode recomputes from the
+originals rather than compounding, and switching back to Replace and out again
+gets you exactly where you were.
 
-While a session is running you'll see a `tk.backup.<group>` vertex group for any
-group it borrowed. That's how Cancel puts the original weights back — it's real
-data rather than something held in memory, so it survives undo and a file save.
-Add and Finish both clear it.
+**Locking the vertex group pauses the gradient.** `lock_weight` only stops
+Blender's own paint tools — the API writes straight through it — so the gradient
+checks the flag itself and stops rewriting while it is set. The panel says so.
+Unlock and the next change lands. A gradient cannot be added to a locked group
+at all.
 
-Nothing is committed until **Add** or **Finish**. Renaming **Group** mid-session *moves* the
-gradient rather than leaving a copy behind: a group the session created is
-removed under the old name, and one it only borrowed gets its original weights
-back. Only the group named right now carries the gradient.
+#### Renaming and other footnotes
 
-#### Coming back to a group
+A gradient finds its group by name and Blender gives add-ons no rename hook, so
+a rename can only be *inferred*: the name disappears while the number of groups
+holds still, and the group at the remembered index has no gradient of its own.
+**Renaming a vertex group is followed**, and the gradient goes with it.
 
-**Add** saves the gradient — handles, ramp, shape, mask, everything that decides
-the result — onto the object, keyed by the group's name. It's stored as a custom
-property on the object, so it survives saving the file.
+Deleting a group moves the count, so that is not mistaken for a rename — the
+gradient is dropped rather than adopting whichever group shuffled into the gap.
+Reordering groups drops it too. Ctrl+Z brings it back in either case.
 
-**Group** is a vertex-group search field, so picking an existing group is how you
-go back to one: pick it and its saved gradient loads straight back, ready to
-adjust instead of rebuilt by eye. The panel says **Editing its saved gradient**
-when the group you've picked has one. Typing a name that doesn't exist yet still
-makes a new group, same as before.
+Gradients live on the **object**, so two meshes in a file each keep their own,
+and they save with the file.
 
-The field lists *all* vertex groups rather than only the ones this tool built,
-because pointing a gradient at a group that already exists is useful in itself —
-it overwrites that group and, with **Mask**, blends into it. Picking a group with
-no saved gradient just means there's nothing to load.
-
-The catch: the key is the group's **name**, so renaming the group in Blender's
-own vertex-group list orphans its saved gradient. (`VertexGroup` can't hold
-custom properties at all, so there's nowhere closer to attach it.) Renaming in
-the panel's **Group** field after an Add doesn't rename the committed group
-either — it starts the next one, which is the point of Add.
+When a gradient adopts a group that already had weights, it keeps a copy of them
+on itself. That is what **Mask** blends *towards* — the original weights can't be
+read off the group once the gradient has started overwriting it — and what
+**Remove** hands back. It is invisible, it goes when the gradient does, and it
+puts nothing extra in your vertex group list.
 
 #### Shapes
 
@@ -259,20 +293,31 @@ segments, never the handles: a handle always reads back exactly the weight its
 stop shows. Past the outermost handle the weight holds flat — a handle is a
 control point, not a boundary.
 
-**Distribute Evenly** spaces the stops out from one end of the scale to the
-other, which is the plain even run you'd get from a gradient you never touched.
-It's the way back after hand-editing the stops.
+**Weights**, **Space** and **Relax** even out the handles. Weights and
+positions are independent — one says what value a handle reaches, the other
+where along the path it sits — and hand-dragged handles bunch up in both, so
+they are separate presses:
+
+| Button | What it does |
+| --- | --- |
+| **Weights** | Spaces the stops from one end of the scale to the other: the plain even run you'd get from a gradient you never touched. The way back after hand-editing the stops. Moves no handle. |
+| **Space** | Respaces the handles at equal arc length along the path, ends pinned. On a **Curved** path the curve is rebuilt from the new handles, so it shifts a little and a second press converges. Changes no weight. |
+| **Relax** | Pulls each handle towards the midpoint of its neighbours, ends pinned. Straightens kinks and shortens the path; **Factor** and **Repeat** in the redo panel (F9) are how far and how many passes. Repeating walks the path towards a straight line — it's a strength dial, not a tidy-up. |
+
+Space and Relax are not the same operation and neither converges to the other:
+on a path with a kink, Space keeps the kink and evens the spacing, Relax
+flattens the kink and leaves the spacing lumpy.
 
 Blender lets a ramp drop to a single stop; a gradient needs two ends, so the
 floor here is **two** — remove past it and the missing stop reappears at the far
 end. The ramp has no update callback and its `+` / `−` are not even operators, so
-edits to it are noticed by polling while a session is open.
+edits to it are noticed by polling while the handles are live.
 
 | Option | What it does |
 | --- | --- |
 | **Smooth** | Relaxation passes over the finished weights. |
 | **Mask** | Give it a vertex group and weights are only written where that group has weight. Outside it, existing weights are untouched; a soft mask edge blends old into new. The protected region is **tinted red in the viewport**, so a low weight there reads as masked rather than as the gradient reaching zero. |
-| **Invert** | Negates every weight, and moves the stops to where those weights now read on the bar. A gradient and its inverse add up to **exactly 1** at every vertex, so the pair is genuinely complementary — Add, tick Invert, Finish. |
+| **Invert** | Negates every weight, and moves the stops to where those weights now read on the bar. A gradient and its inverse add up to **exactly 1** at every vertex, so the pair is genuinely complementary — `+`, then tick Invert. |
 
 #### Where the handles start
 

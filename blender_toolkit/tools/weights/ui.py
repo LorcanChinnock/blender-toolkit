@@ -2,13 +2,7 @@ import bpy
 
 from . import properties
 from .gradient import PATH_SHAPES
-from .operators import (
-    TK_OT_add_gradient,
-    TK_OT_cancel_gradient,
-    TK_OT_distribute_handle_weights,
-    TK_OT_finish_gradient,
-    TK_OT_start_gradient,
-)
+from .operators import TK_OT_add_gradient, TK_OT_distribute_handles
 
 
 class TK_PT_weights(bpy.types.Panel):
@@ -25,59 +19,69 @@ class TK_PT_weights(bpy.types.Panel):
             layout.label(text="Select a mesh", icon='INFO')
             return
 
-        settings = obj.tk_gradient
-        if not settings.active:
-            # One entry point. tk.write_gradient is the same thing without a
-            # session, kept for scripting rather than shown as a rival button.
-            layout.operator(TK_OT_start_gradient.bl_idname, icon='MOD_VERTEX_WEIGHT')
+        # No vertex group list here: Object Data Properties already has one, and
+        # a second copy is a second thing to keep in step. The panel works on
+        # whichever group is active there, and says which that is.
+        active = obj.vertex_groups.active
+        if active is not None:
+            layout.label(text=active.name, icon='GROUP_VERTEX')
+
+        settings = properties.active_gradient(obj)
+        if settings is None:
+            layout.operator(
+                TK_OT_add_gradient.bl_idname,
+                icon='MOD_VERTEX_WEIGHT',
+                text="Add Gradient" if active else "New Group with Gradient",
+            )
             return
 
-        layout.label(text="Weight Gradient", icon='MOD_VERTEX_WEIGHT')
+        row = layout.row()
+        row.use_property_split = True
+        row.prop(obj, "tk_gradient_snap")
 
-        # The group the gradient writes into comes first: it is the subject of
-        # every control below, and of all three buttons.
-        col = layout.column()
-        col.use_property_split = True
-        # A search field, not a plain text one: picking an existing group is how
-        # you go back and edit one, and typing still names a new group.
-        col.prop_search(
-            settings, "group_name", obj, "vertex_groups", icon='GROUP_VERTEX'
-        )
-        if properties.has_record(obj, settings.group_name):
-            col.label(text="Editing its saved gradient", icon='RECOVER_LAST')
+        header, body = layout.panel("tk_gradient_falloff")
+        header.label(text="Falloff")
+        if body is not None:
+            body.use_property_split = True
+            body.prop(settings, "shape")
+            if settings.shape in PATH_SHAPES:
+                body.prop(settings, "curved")
+            body.prop(settings, "invert")
+            body.prop(settings, "smooth_repeat")
+            body.prop(settings, "blend")
+            body.prop_search(settings, "mask_group", obj, "vertex_groups")
 
-        row = layout.row(align=True)
-        row.operator(TK_OT_add_gradient.bl_idname, icon='ADD')
-        row.operator(TK_OT_finish_gradient.bl_idname, icon='CHECKMARK')
-        row.operator(TK_OT_cancel_gradient.bl_idname, icon='X')
-        if settings.added_names:
-            layout.label(text=f"Added: {settings.added_names}", icon='CHECKMARK')
+        header, body = layout.panel("tk_gradient_weights")
+        header.label(text="Weights")
+        if body is not None:
+            # The one weight editor. Its + and - are how handles are added and
+            # removed, and its Pos field is how an exact weight is typed - there
+            # is deliberately no second list of the same numbers beside it.
+            if settings.ramp is not None:
+                body.template_color_ramp(settings.ramp, "color_ramp", expand=True)
 
-        layout.use_property_split = True
-        col = layout.column()
-        col.prop_search(settings, "mask_group", obj, "vertex_groups")
-        col.prop(settings, "shape")
-        col.prop(settings, "snap")
-        col.prop(settings, "invert")
-        if settings.shape in PATH_SHAPES:
-            col.prop(settings, "curved")
-        col.prop(settings, "smooth_repeat")
+            # One operator, one entry per mode - the mesh.select_all idiom.
+            # Weights and positions are independent, so separate presses.
+            row = body.row(align=True)
+            for mode, label, icon in (
+                ('WEIGHTS', "Weights", 'ARROW_LEFTRIGHT'),
+                ('POSITIONS', "Space", 'MOD_ARRAY'),
+                ('RELAX', "Relax", 'MOD_SMOOTH'),
+            ):
+                row.operator(
+                    TK_OT_distribute_handles.bl_idname, text=label, icon=icon
+                ).mode = mode
+            body.use_property_split = True
+            body.prop(settings, "profile")
 
-        # Its + and - buttons are how handles are added and removed; the stops
-        # are held greyscale because this picks a value, not a colour.
-        if settings.ramp is not None:
-            layout.template_color_ramp(settings.ramp, "color_ramp", expand=True)
-        layout.operator(TK_OT_distribute_handle_weights.bl_idname, icon='ARROW_LEFTRIGHT')
-        layout.prop(settings, "profile")
-
-        if settings.shape in PATH_SHAPES:
-            # Handles are placed by dragging them in the viewport, and their
-            # number comes from the gradient above - one per stop.
-            layout.label(
-                text=f"{len(settings.handles)} handles - drag in the viewport, "
-                "+ above adds one",
-                icon='HANDLETYPE_VECTOR_VEC',
-            )
+        # A state, not a warning, and there is no button to point at: painting
+        # on the group is what ends the gradient, the way Blender's redo panel
+        # closes the moment you do anything else.
+        group = obj.vertex_groups.get(settings.group_name)
+        if group is not None and group.lock_weight:
+            layout.label(text="Group is locked - the gradient is paused.", icon='LOCKED')
+        else:
+            layout.label(text="Painting here detaches the gradient.", icon='INFO')
 
 
 classes = (TK_PT_weights,)
