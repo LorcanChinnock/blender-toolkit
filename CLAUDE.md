@@ -5,8 +5,8 @@ Guidance for Claude Code working in this repository.
 ## What this is
 
 `blender-toolkit` is a Blender add-on bundling repetitive game-asset workflows
-into single operators: retopology setup, shapekey surgery, vertex group falloffs,
-rigging helpers, FBX export. Five independent tool modules under
+into single operators: retopology setup, mesh checks, shapekey surgery, vertex
+group falloffs, rigging helpers, FBX export. Six independent tool modules under
 `blender_toolkit/tools/`, each toggleable from the add-on preferences.
 
 See [README.md](README.md) for what each tool does and how to install it.
@@ -428,6 +428,16 @@ old ones are what bpy has registered.
 - **A `ColorRamp` is capped at 32 elements** — `Unable to add element to
   colorband (limit 32)`. One handle per stop makes that the handle ceiling too,
   so the gizmo pool matches it rather than imposing a second limit.
+- **`BMEdge.is_contiguous` is the built-in winding test** — "manifold, between
+  two faces with the same winding". Comparing the two loops' start vertices by
+  hand computes exactly the same thing; `tools/mesh/checks.py` uses the
+  property. It is False on a boundary edge too, so it needs an `is_manifold`
+  guard or every open edge reads as flipped.
+- **`is_manifold` is not the non-manifold check a retopo tool wants.** Blender
+  counts a one-face boundary edge as non-manifold, and a retopo shell in
+  progress is nearly all boundary — the report drowns. `checks.non_manifold`
+  looks for `len(edge.link_faces) > 2` instead and leaves wire edges to the
+  loose-geometry check.
 - `edit_bones` references die on mode switch. Store bone *names* across a
   mode change, not the bones.
 - Bone-name aliases in `PART_ALIASES` are order-sensitive: first match wins, so

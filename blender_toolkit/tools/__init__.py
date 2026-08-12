@@ -3,7 +3,7 @@ import bpy
 from ..utils import load_submodules, prefs
 
 # Add a module here and to preferences.use_<name>; nothing else needs editing.
-MODULE_NAMES = ("retopo", "shapekeys", "weights", "rigging", "export")
+MODULE_NAMES = ("retopo", "mesh", "shapekeys", "weights", "rigging", "export")
 
 load_submodules(globals(), __package__, MODULE_NAMES)
 

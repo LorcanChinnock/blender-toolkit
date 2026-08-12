@@ -1,8 +1,8 @@
 # Blender Toolkit
 
 A Blender add-on that collapses the repetitive click-paths of game-asset work
-into single buttons: retopology setup, shapekey surgery, vertex-group falloffs,
-rigging helpers, and an FBX export preset.
+into single buttons: retopology setup, mesh checks, shapekey surgery,
+vertex-group falloffs, rigging helpers, and an FBX export preset.
 
 **Requires Blender 5.2 LTS.** It uses 5.x-only API, so it will not run on
 3.6 or 4.x.
@@ -30,7 +30,7 @@ That's it — no dependencies, nothing to build.
 | --- | --- |
 | **Sidebar** | 3D View ▸ press `N` ▸ **Toolkit** tab |
 | **Pie menu** | `Shift + Alt + Q` |
-| **Toggles** | Preferences ▸ Add-ons ▸ Blender Toolkit — turn off any of the five modules and its panel and pie slot disappear |
+| **Toggles** | Preferences ▸ Add-ons ▸ Blender Toolkit — turn off any of the six modules and its panel and pie slot disappear |
 
 ### Updating
 
@@ -40,10 +40,11 @@ Install the new zip over the old one, then restart Blender.
 
 ## Features
 
-Five independent modules. Each section below is one panel in the sidebar.
+Six independent modules. Each section below is one panel in the sidebar.
 
 <!-- TOC -->
 - [Retopology](#retopology) — one-click shrinkwrap + snapping setup
+- [Mesh](#mesh) — find the geometry that will cause trouble later
 - [Shapekeys](#shapekeys) — apply modifiers without losing keys, split keys by weight
 - [Weights](#weights) — interactive vertex-group gradients
 - [Rigging](#rigging) — humanoid validation, pose toggle, twist bones
@@ -61,6 +62,57 @@ Five independent modules. Each section below is one panel in the sidebar.
 It creates an empty mesh in the same collection, draws it in front of the
 sculpt, adds a Shrinkwrap modifier onto the sculpt with Display on Cage, turns
 on Face Project snapping, and leaves you in Edit mode.
+
+#### Pressing it again
+
+The second press takes you back to the retopo mesh you already have — from the
+sculpt or from the retopo mesh itself. It doesn't make a second one.
+
+What marks a mesh as a retopo mesh is simply **its Shrinkwrap modifier**. There
+is no hidden bookkeeping: delete the modifier and the mesh is an ordinary mesh
+again, which is also how you ask for a second retopo mesh on the same sculpt.
+A shrinkwrap you added by hand counts too.
+
+#### Options
+
+All five are in the redo panel (`F9`), so you can change your mind after the
+fact rather than undoing and starting over.
+
+| Option | What it does |
+| --- | --- |
+| **Offset** | Lifts the shell off the surface. The fix for z-fighting on a dense sculpt. |
+| **Mirror** | Adds a Mirror modifier **above** the shrinkwrap — so the mirrored half projects too — with Clipping on, and turns on the mesh's X symmetry. Turning it back off removes it again. |
+| **Seed From Selection** | Starts the mesh from a copy of the sculpt's selected faces instead of empty. Nothing selected just means you start empty. Skipped when it's returning you to a mesh you already have, since that would drop a duplicate on top of your work. |
+| **Snapping** | On by default. Turn it off to leave your snap settings alone. |
+| **Auto Merge** | Welds vertices dropped on top of each other. Off unless you ask. |
+
+Both are scene settings, and the operator doesn't put them back — same as
+changing them yourself. Ctrl+Z, or the header, if you want them back.
+
+---
+
+### Mesh
+
+**Validate Mesh** — reports the geometry that will cause trouble later, and
+**selects it** so you can go straight to it. Aimed at retopo output, but it
+checks any mesh.
+
+| Checked | Why |
+| --- | --- |
+| **Ngons** | Faces over four sides. They triangulate unpredictably and subdivide badly. |
+| **Poles** | Vertices joining more than five edges. Pinches under subdivision. |
+| **Non-manifold edges** | Edges shared by three or more faces. |
+| **Loose** | Vertices on no edge, edges on no face. Invisible, and they still export. |
+| **Flipped** | Neighbouring faces that disagree about which way is out — what Recalculate Normals fixes. |
+
+A clean mesh reports *Mesh is clean*.
+
+**Boundary edges are deliberately not reported.** Blender counts an edge with
+one face as non-manifold, but a retopo shell in progress is nearly all boundary,
+so including them would bury everything else.
+
+Selection follows your select mode, so loose vertices and poles show up in
+**vertex** mode — switch to it if a reported count seems to select nothing.
 
 ---
 

@@ -18,6 +18,12 @@ class TK_AddonPreferences(bpy.types.AddonPreferences):
         default=True,
         update=_refresh_panels,
     )
+    use_mesh: bpy.props.BoolProperty(
+        name="Mesh",
+        description="Enable the mesh checking tools",
+        default=True,
+        update=_refresh_panels,
+    )
     use_shapekeys: bpy.props.BoolProperty(
         name="Shapekeys",
         description="Enable the shapekey tools",
@@ -46,6 +52,7 @@ class TK_AddonPreferences(bpy.types.AddonPreferences):
     def draw(self, context):
         col = self.layout.column(heading="Modules")
         col.prop(self, "use_retopo")
+        col.prop(self, "use_mesh")
         col.prop(self, "use_shapekeys")
         col.prop(self, "use_weights")
         col.prop(self, "use_rigging")

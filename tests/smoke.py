@@ -58,6 +58,125 @@ def test_retopo():
     bpy.ops.object.mode_set(mode='OBJECT')
 
 
+def test_retopo_adopts():
+    """A second press returns to the mesh you have, not to _retopo.001."""
+    reset()
+    sculpt = add_cube("Sculpt")
+    assert bpy.ops.tk.retopo_setup() == {'FINISHED'}
+    first = bpy.context.active_object
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    # From the retopo mesh itself: its shrinkwrap names the source.
+    assert bpy.ops.tk.retopo_setup() == {'FINISHED'}
+    assert bpy.context.active_object is first
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    # And from the sculpt, which is the accidental-double-press case.
+    bpy.context.view_layer.objects.active = sculpt
+    assert bpy.ops.tk.retopo_setup() == {'FINISHED'}
+    assert bpy.context.active_object is first
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    made = [o.name for o in bpy.data.objects if o.name.endswith("_retopo")]
+    assert made == ["Sculpt_retopo"], made
+
+
+def test_retopo_properties():
+    reset()
+    add_cube("Sculpt")
+    assert bpy.ops.tk.retopo_setup(offset=0.02, mirror=True) == {'FINISHED'}
+    retopo = bpy.context.active_object
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    # Mirror above the shrinkwrap, so the mirrored half projects too.
+    assert [m.type for m in retopo.modifiers] == ['MIRROR', 'SHRINKWRAP']
+    assert retopo.modifiers["Retopo Mirror"].use_clip
+    assert retopo.data.use_mirror_x
+    assert abs(retopo.modifiers["Retopo Shrinkwrap"].offset - 0.02) < 1e-6
+
+    # Turning it back off in the redo panel takes the modifier with it.
+    assert bpy.ops.tk.retopo_setup(mirror=False) == {'FINISHED'}
+    assert [m.type for m in retopo.modifiers] == ['SHRINKWRAP']
+    assert not retopo.data.use_mirror_x
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+
+def test_retopo_tool_settings_optional():
+    reset()
+    add_cube("Sculpt")
+    tool_settings = bpy.context.scene.tool_settings
+    was_snapping = tool_settings.use_snap
+
+    # Snapping is armed by default; auto-merge has to be asked for.
+    assert bpy.ops.tk.retopo_setup(set_snapping=False) == {'FINISHED'}
+    assert tool_settings.use_snap == was_snapping
+    assert not tool_settings.use_mesh_automerge
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    assert bpy.ops.tk.retopo_setup() == {'FINISHED'}
+    assert tool_settings.use_snap
+    assert not tool_settings.use_mesh_automerge
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    assert bpy.ops.tk.retopo_setup(auto_merge=True) == {'FINISHED'}
+    assert tool_settings.use_mesh_automerge
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+
+def test_retopo_seeding():
+    reset()
+    sculpt = add_cube("Sculpt")
+    for polygon in sculpt.data.polygons:
+        polygon.select = polygon.index < 2
+    expected = len({
+        index for polygon in sculpt.data.polygons if polygon.select
+        for index in polygon.vertices
+    })
+
+    assert bpy.ops.tk.retopo_setup(seed_from_selection=True) == {'FINISHED'}
+    retopo = bpy.context.active_object
+    assert len(retopo.data.polygons) == 2
+    assert len(retopo.data.vertices) == expected
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    # Seeding an adopted mesh would dump a duplicate on top of existing work.
+    bpy.context.view_layer.objects.active = sculpt
+    for polygon in sculpt.data.polygons:
+        polygon.select = True
+    assert bpy.ops.tk.retopo_setup(seed_from_selection=True) == {'FINISHED'}
+    assert len(retopo.data.polygons) == 2
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+
+def test_retopo_seeding_without_a_selection():
+    """Warns and carries on empty rather than erroring."""
+    reset()
+    sculpt = add_cube("Sculpt")
+    for polygon in sculpt.data.polygons:
+        polygon.select = False
+
+    assert bpy.ops.tk.retopo_setup(seed_from_selection=True) == {'FINISHED'}
+    assert len(bpy.context.active_object.data.vertices) == 0
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+
+def test_selected_geometry():
+    from blender_toolkit.tools.retopo.operators import selected_geometry
+
+    reset()
+    cube = add_cube()
+    for polygon in cube.data.polygons:
+        polygon.select = polygon.index == 0
+
+    verts, faces = selected_geometry(cube.data)
+    assert len(faces) == 1 and len(verts) == 4
+    # Remapped into the new mesh, not left pointing at the source's indices.
+    assert sorted(faces[0]) == [0, 1, 2, 3]
+    assert set(verts) == {
+        tuple(cube.data.vertices[i].co) for i in cube.data.polygons[0].vertices
+    }
+
+
 def _cube_with_keys(modifier_type):
     obj = add_cube()
     obj.shape_key_add(name="Basis")
@@ -1783,6 +1902,136 @@ def test_export_fbx():
     assert os.path.getsize(other) > 0
 
 
+def _triangle_pair(second):
+    """Two triangles sharing an edge, the second wound as given."""
+    bm = bmesh.new()
+    a = bm.verts.new((0.0, 0.0, 0.0))
+    b = bm.verts.new((1.0, 0.0, 0.0))
+    c = bm.verts.new((0.0, 1.0, 0.0))
+    d = bm.verts.new((0.0, -1.0, 0.0))
+    bm.faces.new((a, b, c))
+    bm.faces.new((a, b, d) if second == 'SAME' else (b, a, d))
+    return bm
+
+
+def test_mesh_checks_pass_a_clean_mesh():
+    from blender_toolkit.tools.mesh import checks
+
+    reset()
+    cube = add_cube()
+    bm = bmesh.new()
+    bm.from_mesh(cube.data)
+    try:
+        assert checks.run(bm) == [(label, []) for label, _ in checks.CHECKS]
+    finally:
+        bm.free()
+
+
+def test_mesh_checks_ngons_and_poles():
+    import math
+
+    from blender_toolkit.tools.mesh import checks
+
+    bm = bmesh.new()
+    corners = [
+        bm.verts.new((x, y, 0.0))
+        for x, y in ((0, 0), (1, 0), (2, 1), (1, 2), (0, 1))
+    ]
+    bm.faces.new(corners)
+    try:
+        assert len(checks.ngons(bm)) == 1
+        assert checks.poles(bm) == []
+        # Every edge here is boundary. Not reported: a shell in progress is all
+        # boundary, so those would bury everything else.
+        assert checks.non_manifold(bm) == []
+        assert checks.loose(bm) == []
+    finally:
+        bm.free()
+
+    bm = bmesh.new()
+    center = bm.verts.new((0.0, 0.0, 0.0))
+    ring = [
+        bm.verts.new((math.cos(i * math.tau / 6), math.sin(i * math.tau / 6), 0.0))
+        for i in range(6)
+    ]
+    for i in range(6):
+        bm.faces.new((center, ring[i], ring[(i + 1) % 6]))
+    try:
+        assert checks.poles(bm) == [center]  # six edges, one over the limit
+        assert checks.ngons(bm) == []
+    finally:
+        bm.free()
+
+
+def test_mesh_checks_loose_and_non_manifold():
+    from blender_toolkit.tools.mesh import checks
+
+    bm = bmesh.new()
+    stray = bm.verts.new((5.0, 0.0, 0.0))
+    a = bm.verts.new((0.0, 0.0, 0.0))
+    b = bm.verts.new((1.0, 0.0, 0.0))
+    wire = bm.edges.new((a, b))
+    try:
+        # a and b are on an edge, so only the stray vert and the wire count.
+        assert set(checks.loose(bm)) == {stray, wire}
+    finally:
+        bm.free()
+
+    bm = bmesh.new()
+    a = bm.verts.new((0.0, 0.0, 0.0))
+    b = bm.verts.new((1.0, 0.0, 0.0))
+    fan = [
+        bm.verts.new(co)
+        for co in ((0.0, 1.0, 0.0), (0.0, -1.0, 0.0), (0.0, 0.0, 1.0))
+    ]
+    for vert in fan:
+        bm.faces.new((a, b, vert))
+    try:
+        shared = checks.non_manifold(bm)
+        assert len(shared) == 1 and len(shared[0].link_faces) == 3
+    finally:
+        bm.free()
+
+
+def test_mesh_checks_winding():
+    from blender_toolkit.tools.mesh import checks
+
+    bm = _triangle_pair('SAME')
+    try:
+        # Both faces run a->b, so they disagree about which way is out.
+        assert len(checks.inconsistent_winding(bm)) == 1
+    finally:
+        bm.free()
+
+    bm = _triangle_pair('OPPOSITE')
+    try:
+        assert checks.inconsistent_winding(bm) == []
+    finally:
+        bm.free()
+
+
+def test_validate_mesh():
+    reset()
+    cube = add_cube()
+    assert bpy.ops.tk.validate_mesh() == {'FINISHED'}
+    assert bpy.context.mode == 'EDIT_MESH'
+    bpy.ops.object.mode_set(mode='OBJECT')
+    assert not any(vert.select for vert in cube.data.vertices)
+
+    # A stray vertex is loose geometry, and lands selected so it can be found.
+    bm = bmesh.new()
+    bm.from_mesh(cube.data)
+    bm.verts.new((5.0, 0.0, 0.0))
+    bm.to_mesh(cube.data)
+    bm.free()
+    cube.data.update()
+
+    assert bpy.ops.tk.validate_mesh() == {'FINISHED'}
+    bpy.ops.object.mode_set(mode='OBJECT')
+    selected = [vert.index for vert in cube.data.vertices if vert.select]
+    assert selected == [len(cube.data.vertices) - 1], selected
+
+
 def test_modules_wired():
     """Every tool directory is in MODULE_NAMES with a matching preference."""
     from blender_toolkit import tools
@@ -1880,8 +2129,8 @@ def test_unregister_is_clean():
         assert not hasattr(bpy.types, "TK_PG_gradient_handle")
         assert not hasattr(bpy.types, "TK_PG_weight_gradient")
         for name in (
-            "TK_PT_retopo", "TK_PT_shapekeys", "TK_PT_weights", "TK_PT_rigging",
-            "TK_PT_export",
+            "TK_PT_retopo", "TK_PT_mesh", "TK_PT_shapekeys", "TK_PT_weights",
+            "TK_PT_rigging", "TK_PT_export",
             "TK_MT_pie_main", "TK_AddonPreferences",
         ):
             assert not hasattr(bpy.types, name), name
