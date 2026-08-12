@@ -30,10 +30,10 @@ from mathutils.geometry import barycentric_transform
 _cache = (None, None)
 
 MODES = (
-    ('FREE', "Free", "Drag in the view plane, ignoring the surface"),
+    ('FREE', "Free", "Drag freely, ignoring the surface"),
     ('VERTEX', "Vertex", "Snap to the nearest vertex"),
-    ('EDGE', "Edge", "Snap to the nearest point on an edge"),
-    ('FACE', "Face", "Snap to the nearest point on the surface"),
+    ('EDGE', "Edge", "Snap to the nearest edge"),
+    ('FACE', "Face", "Snap to the surface"),
 )
 
 

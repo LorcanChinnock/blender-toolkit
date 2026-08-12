@@ -853,12 +853,15 @@ class TK_PG_weight_gradient(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty(name="Name", default="Gradient")
 
     shape: bpy.props.EnumProperty(
-        name="Shape", items=gradient.SHAPES, default='LINEAR', update=_rewrite
+        name="Shape",
+        description="How the weight falls off around the path",
+        items=gradient.SHAPES,
+        default='LINEAR',
+        update=_rewrite,
     )
     profile: bpy.props.EnumProperty(
         name="Profile",
-        description="How the weight travels from one handle to the next. The "
-        "handles themselves always read exactly what their stops say",
+        description="How the weight eases from one handle to the next",
         items=gradient.PROFILES,
         default='LINEAR',
         update=_rewrite,
@@ -866,22 +869,22 @@ class TK_PG_weight_gradient(bpy.types.PropertyGroup):
     handles: bpy.props.CollectionProperty(type=TK_PG_gradient_handle)
     curved: bpy.props.BoolProperty(
         name="Curved",
-        description="Bend the path smoothly through the handles instead of "
-        "running straight between them",
+        description="Curve the path through the handles instead of running "
+        "straight between them",
         default=False,
         update=_rewrite,
     )
     ramp: bpy.props.PointerProperty(type=bpy.types.Texture)
     invert: bpy.props.BoolProperty(
         name="Invert",
-        description="Negate every weight, so a gradient and its inverse add up "
-        "to 1 everywhere. The stops move to where their weights now read",
+        description="Flip the weights, so this gradient and an uninverted one "
+        "add up to 1 everywhere",
         default=False,
         update=_invert_changed,
     )
     smooth_repeat: bpy.props.IntProperty(
         name="Smooth",
-        description="Relaxation passes over the weights",
+        description="Blur the result across neighbouring vertices",
         default=0,
         min=0,
         max=20,
@@ -889,24 +892,21 @@ class TK_PG_weight_gradient(bpy.types.PropertyGroup):
     )
     group_name: bpy.props.StringProperty(
         name="Group",
-        description="Vertex group this gradient writes. It owns that group - "
-        "point it at another and the weights move with it",
+        description="Vertex group this gradient writes",
         default="Group",
         update=_rename_group,
     )
     blend: bpy.props.EnumProperty(
         name="Blend",
-        description="What the gradient does to the weights the group already "
-        "had when it was adopted. A group the gradient created had none, so "
-        "everything but Replace leaves it empty",
+        description="How the gradient combines with the weights the group "
+        "already had",
         items=gradient.BLENDS,
         default='REPLACE',
         update=_rewrite,
     )
     mask_group: bpy.props.StringProperty(
         name="Mask",
-        description="Only write where this group has weight; elsewhere the "
-        "weights the group had before the gradient adopted it are left alone",
+        description="Only write where this group has weight",
         update=_rewrite,
     )
 

@@ -15,8 +15,8 @@ def _clamp(value):
 
 SHAPES = (
     ('LINEAR', "Path", "Ramp along the path through the handles"),
-    ('SPHERICAL', "Spherical", "Distance from the first handle, 1 at the last"),
-    ('BAND', "Band", "0 on the plane through the middle, 1 at both ends"),
+    ('SPHERICAL', "Spherical", "Ramp outwards from the first handle to the last"),
+    ('BAND', "Band", "Ramp out to both ends from the middle of the path"),
 )
 
 # Only the path shape uses the handles in between; the other two are radial
@@ -52,13 +52,13 @@ def weight_of(colour):
 # Blender's own proportional-edit vocabulary. The curves mirror those falloffs;
 # they are not claimed to be bit-identical to Blender's internals.
 PROFILES = (
-    ('LINEAR', "Linear", "t"),
-    ('SMOOTH', "Smooth", "t^2 (3 - 2t)"),
-    ('SPHERE', "Sphere", "sqrt(1 - (1 - t)^2)"),
-    ('ROOT', "Root", "sqrt(t)"),
-    ('SHARP', "Sharp", "t^2"),
-    ('INVERSE_SQUARE', "Inverse Square", "t^4"),
-    ('CONSTANT', "Constant", "0 below the midpoint, 1 above"),
+    ('LINEAR', "Linear", "Straight ramp"),
+    ('SMOOTH', "Smooth", "Eases in and out"),
+    ('SPHERE', "Sphere", "Rounded, steepest at the start"),
+    ('ROOT', "Root", "Rises fast, then flattens off"),
+    ('SHARP', "Sharp", "Starts slow, then rises fast"),
+    ('INVERSE_SQUARE', "Inverse Square", "Stays low for longer than Sharp"),
+    ('CONSTANT', "Constant", "Jumps straight from 0 to 1 at the midpoint"),
 )
 
 PROFILE_CURVES = {
@@ -203,11 +203,11 @@ def handle_arc_positions(points, count, curved=False, per_segment=None):
 # and the same names as Blender's Vertex Weight Mix modifier, because that is
 # the tool a user reaches for to do this by hand.
 BLENDS = (
-    ('REPLACE', "Replace", "The gradient's weight, ignoring what was there"),
-    ('ADD', "Add", "Add the gradient to what was there"),
-    ('MULTIPLY', "Multiply", "Scale what was there by the gradient"),
-    ('MIN', "Minimum", "The lower of the two"),
-    ('MAX', "Maximum", "The higher of the two"),
+    ('REPLACE', "Replace", "Use the gradient's weight"),
+    ('ADD', "Add", "Add the gradient to the weights already there"),
+    ('MULTIPLY', "Multiply", "Multiply the weights already there by the gradient"),
+    ('MIN', "Minimum", "Use the lower of the two"),
+    ('MAX', "Maximum", "Use the higher of the two"),
 )
 
 

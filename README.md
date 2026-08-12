@@ -105,233 +105,139 @@ on the second pass to drop the intermediates.
 ### Weights
 
 ![Weight gradient handles in the viewport](docs/images/weights.png)
-<!-- screenshot placeholder: vertex group list, handles + ramp -->
+<!-- screenshot placeholder: handles + ramp in the viewport -->
 
-**Weight Gradient** builds vertex-group weights from a spatial falloff between
-two points: **start** reads 0, **end** reads 1. It writes a plain vertex group,
-so it feeds modifier masks, cloth pin groups, influence limits, corrective
-blends — anything that takes a group.
+**Weight Gradient** fills a vertex group with a falloff you place in the
+viewport. It writes a plain vertex group, so it feeds modifier masks, cloth pin
+groups, influence limits — anything that takes a group.
 
-The points are arbitrary positions, so the gradient runs in any direction; a
-tilted plane is just a start and end that aren't axis-aligned.
+#### Making one
 
-#### A gradient is an attribute of a vertex group
+Pick a vertex group in **Properties ▸ Object Data ▸ Vertex Groups**, open the
+**Toolkit** tab in the sidebar and hit **Add Gradient**. No group selected? It
+makes one. You land in Weight Paint with the path drawn as draggable discs.
 
-There is one list, and it is Blender's own — **Properties ▸ Object Data ▸ Vertex
-Groups**. The Toolkit panel doesn't copy it; it works on whichever group is
-active there and names it at the top. **Selecting a vertex group is selecting a
-gradient.** A group either has one or it doesn't, and the panel shows either its
-settings or an **Add Gradient** button.
+A gradient belongs to its vertex group, so selecting the group is how you get
+back to it later. There is no separate list to keep track of, and the panel
+always works on whichever group is active.
 
-Selecting a group that has a gradient puts its path in the viewport as draggable
-discs — there is no mode to enter and nothing to switch on. Adding a gradient
-drops you into Weight Paint, because that is where the weights it writes are
-visible.
+Everything updates live — drag a handle, drag a stop, switch shape. Nothing to
+re-run and nothing to confirm.
 
-The settings sit in two collapsible sections: **Falloff** is the shape of the
-field, **Weights** is the ramp and what the weights do along the path. The ramp
-is the only weight editor — its `+` / `−` add and remove handles, and its `Pos`
-field is where an exact weight is typed.
+A second gradient starts as a copy of the last one you made, so the usual
+left/right pair is: make one, make another on a new group, tick **Invert**. The
+two add up to exactly 1 everywhere.
 
-Every change rewrites the weights — drag a handle, edit the ramp, switch shape —
-with no re-running. Writes are batched rather than done per event: a drag fires
-an update on every mouse-move, so they are collected and written at most once
-every 150 ms. On a 65k-vertex mesh, moving a handle rebuilds the falloff in
-150–500 ms depending on how many handles there are; anything else — the ramp,
-the profile, the mask, the group name — reuses the cached field and costs about
-110 ms regardless.
+For scripting there's `tk.write_gradient`, which writes the weights once and
+keeps no gradient behind.
 
-**Add Gradient** is the only button. It generates the active vertex group's
-weights, or makes a group if none is selected. A new gradient starts as a copy
-of the last one you added — the reason for a second is nearly always the first
-again with one thing changed, so tick **Invert** and you have the complementary
-pair.
+#### Painting ends it
 
-#### Painting is how a gradient ends
+While a gradient is live it rewrites its group on every change, so your brush
+strokes wouldn't survive. So **painting on the group detaches the gradient** —
+the weights stay exactly as they are, stroke and all, and the group becomes
+ordinary weights. That is the Apply button, and the Remove button, and you never
+have to find either.
 
-A gradient regenerates its group on every change, so while it is live your brush
-strokes would be overwritten. Rather than forbid that, **painting on the group
-detaches the gradient**: the weights stay exactly as they stand, stroke
-included, and the group becomes ordinary weights. There is no Apply button
-because painting *is* Apply, and no Remove button because painting is that too.
+Ctrl+Z is the way back. To protect a region *while* the gradient is live, use
+**Mask** instead.
 
-That is the same bargain as Blender's redo panel, which closes the moment you do
-anything else. Ctrl+Z is the way back.
+Posing an armature or moving a shape key slider won't end a gradient — only an
+actual change to its weights does.
 
-The detach is confirmed, not guessed — a posed armature, a shape key slider and
-a modifier tweak all update the mesh too, and none of them should end a
-gradient. The add-on compares the group against what it actually wrote.
+#### Shape
 
-If you want to protect a region *while* the gradient is live, that is what
-**Mask** is for.
+| Shape | What it does |
+| --- | --- |
+| **Path** | Ramps along the path through the handles. |
+| **Spherical** | Ramps outwards from the first handle to the last. Invert it for a soft mask around a point. |
+| **Band** | Ramps out to both ends from the middle. Invert it for a plateau in the middle. |
 
-#### Adopting a group that already has weights
+**Curved** bends the path smoothly through the handles instead of running
+straight between them. Spherical and Band only use the first and last handle.
 
-Pointing a gradient at a group that already has weights doesn't have to destroy
-them. **Blend** decides what the gradient does to them:
+**Smooth** blurs the finished weights across neighbouring vertices.
+
+#### Handles
+
+Handles are placed by dragging them in the viewport — there are no coordinate
+fields. Each one is drawn in weight paint's colour for the weight it sits at, so
+a handle and the surface under it always match.
+
+**Snap** decides what a dragged handle lands on: **Free** drags in the view
+plane, **Vertex** / **Edge** / **Face** put it on the mesh. It snaps as you drag,
+and it aims down the view ray — the handle lands on whatever is under the
+cursor, on the side facing you.
+
+**Where the handles start** is up to **Points From**. **Auto** uses your
+Edit-mode selection if there is one, otherwise spans the object left to right.
+There is also **Selection** (errors instead of falling back), **Object Bounds**
+along an axis, and **Keep Current**.
+
+#### The ramp
+
+The bar is the weight scale, not a colour picker — blue at 0 through cyan,
+green and yellow to red at 1, exactly weight paint's own colours. Where a stop
+sits on the bar *is* its handle's weight, and the colour follows automatically,
+so the picker Blender opens has nothing to choose.
+
+**The ramp decides how many handles there are** — one per stop. Hit `+` and a
+handle appears; remove the stop and it goes. The floor is two and the ceiling is
+32, which is Blender's own limit on ramp stops.
+
+Stops stay in order, and handles are matched to them along the path, so weights
+run **monotonically** from one end to the other. Dragging one stop past another
+swaps which handle owns which weight. For a peak in the middle, use **Band** or
+a second gradient with a mask.
+
+**Profile** shapes how the weight travels *between* handles — Linear, Smooth,
+Sphere, Root, Sharp, Inverse Square, Constant. A handle always reads back
+exactly the weight its stop shows, and past the outermost handle the weight
+holds flat.
+
+Three buttons even things out:
+
+| Button | What it does |
+| --- | --- |
+| **Weights** | Spreads the stops evenly from one end of the scale to the other. Moves no handle. |
+| **Space** | Spreads the handles evenly along the path, ends pinned. Changes no weight. |
+| **Relax** | Smooths kinks out of the path. **Factor** and **Repeat** in the redo panel (F9) control how much; press again for more. |
+
+Space and Relax aren't the same thing — on a kinked path, Space keeps the kink
+and evens the spacing, Relax flattens the kink.
+
+#### Blend and Mask
+
+**Blend** is what the gradient does to weights the group already had. Same set
+and same names as the **Vertex Weight Mix** modifier:
 
 | Mode | Result |
 | --- | --- |
-| **Replace** | The gradient's weight, ignoring what was there. The default. |
+| **Replace** | The gradient's weight. The default. |
 | **Add** | The two summed, clamped to 1. |
 | **Multiply** | What was there, scaled by the gradient. |
 | **Minimum** / **Maximum** | The lower or higher of the two. |
 
-Same set and same names as Blender's **Vertex Weight Mix** modifier. The blend
-is always against the weights the group had *when the gradient adopted it*, not
-against the gradient's own last result — so changing mode recomputes from the
-originals rather than compounding, and switching back to Replace and out again
-gets you exactly where you were.
+Blending is always against the weights the group had when the gradient took it
+over, never against the gradient's own last result — so changing mode recomputes
+from the originals instead of stacking, and switching back to **Replace** gets
+you exactly where you started.
 
-**Locking the vertex group pauses the gradient.** `lock_weight` only stops
-Blender's own paint tools — the API writes straight through it — so the gradient
-checks the flag itself and stops rewriting while it is set. The panel says so.
-Unlock and the next change lands. A gradient cannot be added to a locked group
-at all.
+**Mask** takes a vertex group and only writes where that group has weight.
+Elsewhere the existing weights are left alone, and a soft mask edge blends old
+into new. The protected region is tinted red in the viewport, so a low weight
+there reads as masked rather than as the gradient bottoming out.
 
-#### Renaming and other footnotes
+#### Good to know
 
-A gradient finds its group by name and Blender gives add-ons no rename hook, so
-a rename can only be *inferred*: the name disappears while the number of groups
-holds still, and the group at the remembered index has no gradient of its own.
-**Renaming a vertex group is followed**, and the gradient goes with it.
+**Locking the group pauses the gradient.** The panel says so, and unlocking lets
+the next change through. You can't add a gradient to a locked group.
 
-Deleting a group moves the count, so that is not mistaken for a rename — the
-gradient is dropped rather than adopting whichever group shuffled into the gap.
-Reordering groups drops it too. Ctrl+Z brings it back in either case.
+**Renaming the group is fine** — the gradient follows it. Deleting the group, or
+reordering your groups, drops the gradient instead; Ctrl+Z brings it back.
 
-Gradients live on the **object**, so two meshes in a file each keep their own,
-and they save with the file.
-
-When a gradient adopts a group that already had weights, it keeps a copy of them
-on itself. That is what **Mask** blends *towards* — the original weights can't be
-read off the group once the gradient has started overwriting it — and what
-**Remove** hands back. It is invisible, it goes when the gradient does, and it
-puts nothing extra in your vertex group list.
-
-#### Shapes
-
-| Shape | Falloff |
-| --- | --- |
-| **Path** | Ramp along the path running through the handles. |
-| **Spherical** | Distance from the first handle, reaching 1 at the last. Inverted: a local mask around a point. |
-| **Band** | 0 on the plane through the middle, 1 at both ends. Inverted: a plateau between the two points. |
-
-#### Handles
-
-A gradient is a **path**, not just two points. `t` is each vertex's position
-along the *arc length*, so past a bend the weight follows the bend rather than
-the straight line.
-
-Where two stretches of the path are about equally close, they **share** a
-vertex rather than the nearer one taking it outright. Taking the nearest
-outright is what produces hard bands on the concave side of a bend: a vertex
-there is equidistant from two stretches whose positions along the path are far
-apart, and the weight jumps across that tie line. Sharing removes the jump
-entirely; away from a bend one stretch is clearly nearest and nothing changes.
-Handles are unaffected either way — the two segments meeting at a bend both
-report that corner, so they already agree.
-
-Smoothing is not an alternative here: it diffuses a step as 1/√passes, so on a
-0.50 jump twenty passes only reached 0.07 while blurring everything else. Two handles behaves exactly like a plain linear ramp.
-**Curved** smooths the path through the handles instead of running straight
-between them.
-
-**The gradient decides how many handles exist** — one per stop. Hit `+` on the
-gradient and a handle appears at that spot along the path; remove the stop and
-it goes. The ceiling is **32**, which is Blender's own hard limit on ramp stops
-rather than one this add-on imposes. Handles are positioned by dragging in the viewport, never by typing
-coordinates. Adding a stop in the middle inserts a handle in the middle, and
-handles you've already dragged stay put.
-
-**A stop's position on the bar is its handle's weight.** Slide it right and that
-handle weighs more; the handle recolours to match and moves nowhere in the
-viewport. Where a handle falls *along the path* is the handle's own business —
-you dragged it there in 3D — so the two controls never fight over it.
-
-One consequence: the widget keeps stops in order and handles are matched to them
-in path order, so weights run **monotonically** along the path. Dragging one stop
-past another swaps which handle owns which weight. For a peak in the middle, use
-the **Band** shape or a second gradient with a mask.
-
-Spherical and Band only read the first and last handle, so the panel stops
-offering the ones in between.
-
-**Snap** decides what a dragged handle lands on: **Free** moves it in the view
-plane; **Vertex** / **Edge** / **Face** put it on the mesh. Snapping happens as
-the handle moves, not on release, and it aims **down the view ray** — the handle
-lands on whatever is under the cursor, on the side of the mesh you're looking
-at. (Snapping to the nearest surface in 3D would drop it on the far side as soon
-as you dragged past the surface.)
-
-**Handles are drawn in weight paint's own colour for the weight they sit at** —
-blue at 0, through cyan, green and yellow, to red at 1. A handle and the surface
-under it agree, so inverting or dragging a stop recolours the handles to match
-without needing a legend. They're solid discs rather than rings.
-
-#### Values
-
-The **gradient** maps position along the path to weight. Its `+` / `−` buttons
-add and remove stops, and therefore handles — that native add/remove is why it's
-a colour ramp widget rather than a curve one, and why there is no second handle
-list to keep in step with it.
-
-The bar is a **fixed scale you read a weight off** — weight paint's own, blue →
-cyan → green → yellow → red — not a colour picker. A stop's colour is simply the
-scale's colour where it sits, so there is nothing to choose: Blender's widget
-still opens a picker, but whatever you pick is overwritten on the next poll.
-
-That works because weight paint's ramp is a sweep of hue at full saturation —
-one number. The ramp is held in **HSV / Counter-Clockwise**, where the bar
-renders as the true scale. In the ordinary RGB mode blue → red runs through
-purple instead, which is no weight at all; the mode dropdowns are part of the
-widget, so switching them is undone too.
-
-**Profile** decides how the weight travels *between* one handle and the next —
-Linear, Smooth, Sphere, Root, Sharp, Inverse Square, Constant. It shapes the
-segments, never the handles: a handle always reads back exactly the weight its
-stop shows. Past the outermost handle the weight holds flat — a handle is a
-control point, not a boundary.
-
-**Weights**, **Space** and **Relax** even out the handles. Weights and
-positions are independent — one says what value a handle reaches, the other
-where along the path it sits — and hand-dragged handles bunch up in both, so
-they are separate presses:
-
-| Button | What it does |
-| --- | --- |
-| **Weights** | Spaces the stops from one end of the scale to the other: the plain even run you'd get from a gradient you never touched. The way back after hand-editing the stops. Moves no handle. |
-| **Space** | Respaces the handles at equal arc length along the path, ends pinned. On a **Curved** path the curve is rebuilt from the new handles, so it shifts a little and a second press converges. Changes no weight. |
-| **Relax** | Pulls each handle towards the midpoint of its neighbours, ends pinned. Straightens kinks and shortens the path; **Factor** and **Repeat** in the redo panel (F9) are how far and how many passes. Repeating walks the path towards a straight line — it's a strength dial, not a tidy-up. |
-
-Space and Relax are not the same operation and neither converges to the other:
-on a path with a kink, Space keeps the kink and evens the spacing, Relax
-flattens the kink and leaves the spacing lumpy.
-
-Blender lets a ramp drop to a single stop; a gradient needs two ends, so the
-floor here is **two** — remove past it and the missing stop reappears at the far
-end. The ramp has no update callback and its `+` / `−` are not even operators, so
-edits to it are noticed by polling while the handles are live.
-
-| Option | What it does |
-| --- | --- |
-| **Smooth** | Relaxation passes over the finished weights. |
-| **Mask** | Give it a vertex group and weights are only written where that group has weight. Outside it, existing weights are untouched; a soft mask edge blends old into new. The protected region is **tinted red in the viewport**, so a low weight there reads as masked rather than as the gradient reaching zero. |
-| **Invert** | Negates every weight, and moves the stops to where those weights now read on the bar. A gradient and its inverse add up to **exactly 1** at every vertex, so the pair is genuinely complementary — `+`, then tick Invert. |
-
-#### Where the handles start
-
-**Auto** by default: the Edit-mode selection if there's a usable one, otherwise a
-left-to-right gradient across the whole mesh. The button always does something
-sensible — you never have to go select two vertices first. The report line says
-which it used.
-
-The alternatives are **Selection** (strict — errors instead of falling back),
-**Object Bounds** along a chosen axis, and **Keep Current**. Bounds are measured
-from the mesh's own vertices, not the object bounding box, since an active shape
-key or a modifier moves the latter away from the coordinates the weights are
-computed from. Asking for an axis the mesh is flat along falls back to its
-longest one.
+Gradients live on the **object** and save with the file, so two meshes each keep
+their own.
 
 ---
 

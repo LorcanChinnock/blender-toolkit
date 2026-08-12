@@ -31,7 +31,7 @@ class TK_PT_weights(bpy.types.Panel):
             layout.operator(
                 TK_OT_add_gradient.bl_idname,
                 icon='MOD_VERTEX_WEIGHT',
-                text="Add Gradient" if active else "New Group with Gradient",
+                text="Add Gradient",
             )
             return
 
@@ -79,9 +79,9 @@ class TK_PT_weights(bpy.types.Panel):
         # closes the moment you do anything else.
         group = obj.vertex_groups.get(settings.group_name)
         if group is not None and group.lock_weight:
-            layout.label(text="Group is locked - the gradient is paused.", icon='LOCKED')
+            layout.label(text="Locked - the gradient is paused", icon='LOCKED')
         else:
-            layout.label(text="Painting here detaches the gradient.", icon='INFO')
+            layout.label(text="Painting here detaches the gradient", icon='INFO')
 
 
 classes = (TK_PT_weights,)

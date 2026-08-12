@@ -1637,7 +1637,7 @@ def test_gradient_seeds_without_a_selection():
     assert min(values) < 0.01 and max(values) > 0.99, (min(values), max(values))
 
     # Explicit SELECTION still errors rather than quietly falling back.
-    raises(bpy.ops.tk.write_gradient, "Edit mode", source='SELECTION')
+    raises(bpy.ops.tk.write_gradient, "Edit Mode", source='SELECTION')
 
 
 def _armature(bone_names):

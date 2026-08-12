@@ -13,12 +13,12 @@ def _selection_points(context, obj):
     gradient should reach".
     """
     if context.mode != 'EDIT_MESH':
-        return None, "Select the gradient's vertices in Edit mode first"
+        return None, "Select some vertices in Edit Mode first"
 
     bm = bmesh.from_edit_mesh(obj.data)
     active = bm.select_history.active
     if not isinstance(active, bmesh.types.BMVert):
-        return None, "No active vertex - click the vertex the gradient should end on"
+        return None, "No active vertex - click the one it should end on"
 
     others = [v.co for v in bm.verts if v.select and v != active]
     if not others:
@@ -82,18 +82,18 @@ class _SourceMixin:
     source: bpy.props.EnumProperty(
         name="Points From",
         items=[
-            ('AUTO', "Auto",
-             "The Edit-mode selection if there is a usable one, else the "
+            ('AUTO', "Auto", "Use the selection if there is one, else the "
              "object bounds"),
-            ('SELECTION', "Selection", "Active vertex ends it, the rest start it"),
-            ('BOUNDS', "Object Bounds", "Span the bounding box along an axis"),
+            ('SELECTION', "Selection", "Run from the selected vertices to the "
+             "active one"),
+            ('BOUNDS', "Object Bounds", "Span the object along an axis"),
             ('KEEP', "Keep Current", "Leave the handles where they are"),
         ],
         default='AUTO',
     )
     axis: bpy.props.EnumProperty(
         name="Axis",
-        description="Bounding box axis to span when there is no selection to use",
+        description="Axis to span when using the object bounds",
         items=[(a, a, "") for a in ('X', 'Y', 'Z')],
         default='X',
     )
@@ -105,11 +105,10 @@ class _SourceMixin:
 
 
 class TK_OT_write_gradient(_SourceMixin, bpy.types.Operator):
-    """Write a spatial gradient into a vertex group in one shot
+    """Write a weight gradient into a vertex group in one go"""
 
-    The scripting entry point: no gradient is kept afterwards, so there is
-    nothing to go back and adjust. The panel offers tk.add_gradient instead.
-    """
+    # The scripting entry point: no gradient is kept afterwards, so there is
+    # nothing to go back and adjust. The panel offers tk.add_gradient instead.
 
     bl_idname = "tk.write_gradient"
     bl_label = "Write Weight Gradient"
@@ -120,7 +119,9 @@ class TK_OT_write_gradient(_SourceMixin, bpy.types.Operator):
         name="Profile", items=gradient.PROFILES, default='LINEAR'
     )
     midpoint: bpy.props.FloatProperty(
-        name="Midpoint", default=0.5, min=0.0, max=1.0, subtype='FACTOR'
+        name="Midpoint",
+        description="Where along the ramp the weight reaches half",
+        default=0.5, min=0.0, max=1.0, subtype='FACTOR',
     )
     invert: bpy.props.BoolProperty(name="Invert", default=False)
     smooth_repeat: bpy.props.IntProperty(name="Smooth", default=0, min=0, max=20)
@@ -191,15 +192,11 @@ class _ActiveMixin:
 
 
 class TK_OT_add_gradient(_SourceMixin, bpy.types.Operator):
-    """Generate this vertex group's weights from a gradient, replacing them
+    """Build the active vertex group's weights from a gradient, replacing them"""
 
-    Adds a gradient to the active vertex group, or to a new group when there is
-    none. A gradient is an attribute of a group, so the group's own list is
-    where you pick which one you are editing - there is no second list.
-
-    The new gradient starts as a copy of the last one added: the reason for a
-    second is nearly always the first again with one thing changed.
-    """
+    # Starts from a copy of the last gradient added, and makes a group when none
+    # is selected. A one-line docstring on purpose: Blender shows it verbatim,
+    # newlines and all, so a wrapped paragraph reads ragged in the tooltip.
 
     bl_idname = "tk.add_gradient"
     bl_label = "Add Gradient"
@@ -222,7 +219,7 @@ class TK_OT_add_gradient(_SourceMixin, bpy.types.Operator):
         if active is not None and active.lock_weight:
             # Reported rather than silently doing nothing: putting a generator
             # on a group declared untouchable is a contradiction, not a no-op.
-            self.report({'ERROR'}, f"'{active.name}' is locked")
+            self.report({'ERROR'}, f"Vertex group '{active.name}' is locked")
             return {'CANCELLED'}
 
         seeded, error, origin = _seed_points(self, context, obj)
@@ -241,7 +238,7 @@ class TK_OT_add_gradient(_SourceMixin, bpy.types.Operator):
             properties.set_handles(entry, seeded)
         if len(entry.handles) < 2:
             obj.tk_gradients.remove(len(obj.tk_gradients) - 1)
-            self.report({'ERROR'}, "The gradient needs at least two handles")
+            self.report({'ERROR'}, "Need at least two handles")
             return {'CANCELLED'}
         if Vector(entry.handles[0].position) == Vector(entry.handles[-1].position):
             obj.tk_gradients.remove(len(obj.tk_gradients) - 1)
@@ -265,17 +262,12 @@ class TK_OT_add_gradient(_SourceMixin, bpy.types.Operator):
         if entry.group_name in obj.vertex_groups:
             obj.vertex_groups.active = obj.vertex_groups[entry.group_name]
 
-        self.report({'INFO'}, f"Gradient into '{entry.group_name}' from {origin}")
+        self.report({'INFO'}, f"Added a gradient to '{entry.group_name}' from {origin}")
         return {'FINISHED'}
 
 
 class TK_OT_distribute_handles(_ActiveMixin, bpy.types.Operator):
-    """Even out the handles - what they weigh, or where they sit
-
-    Weights and positions are independent: one says what value each handle
-    reaches, the other where along the path it sits. Hand-dragged handles bunch
-    up in both.
-    """
+    """Even out the handles - what they weigh, or where they sit"""
 
     bl_idname = "tk.distribute_handles"
     bl_label = "Distribute Handles"
@@ -284,25 +276,19 @@ class TK_OT_distribute_handles(_ActiveMixin, bpy.types.Operator):
     mode: bpy.props.EnumProperty(
         name="Mode",
         items=[
-            ('WEIGHTS', "Weights",
-             "Space the handles' weights evenly along the path. Undoes any "
-             "hand-editing of the stops, back to a plain even run"),
-            ('POSITIONS', "Space",
-             "Respace the handles at equal arc length along the path, ends "
-             "pinned"),
-            ('RELAX', "Relax",
-             "Pull each handle towards the midpoint of its neighbours, ends "
-             "pinned. Straightens kinks; repeat for more"),
+            ('WEIGHTS', "Weights", "Space the weights evenly along the path"),
+            ('POSITIONS', "Space", "Space the handles evenly along the path"),
+            ('RELAX', "Relax", "Smooth kinks out of the path. Repeat for more"),
         ],
         default='WEIGHTS',
     )
     factor: bpy.props.FloatProperty(
         name="Factor",
-        description="How far a handle moves towards its neighbours' midpoint",
+        description="How far each handle moves",
         default=0.5, min=0.0, max=1.0, subtype='FACTOR',
     )
     repeat: bpy.props.IntProperty(
-        name="Repeat", description="Relaxation passes", default=1, min=1, max=50
+        name="Repeat", description="Number of passes", default=1, min=1, max=50
     )
 
     def draw(self, context):

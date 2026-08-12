@@ -28,7 +28,7 @@ def register():
     # same for every gradient, and no part of what one produces.
     bpy.types.Object.tk_gradient_snap = bpy.props.EnumProperty(
         name="Snap",
-        description="What a dragged handle lands on",
+        description="What a dragged handle snaps to",
         items=snapping.MODES,
         default='FREE',
     )
