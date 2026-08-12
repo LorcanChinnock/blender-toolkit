@@ -29,6 +29,7 @@ def load_submodules(namespace, package, names):
 # than installed as an add-on, so there is no preferences entry to read.
 _DEFAULT_PREFS = SimpleNamespace(
     use_retopo=True,
+    use_mesh=True,
     use_shapekeys=True,
     use_weights=True,
     use_rigging=True,
