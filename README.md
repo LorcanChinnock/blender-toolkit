@@ -61,7 +61,7 @@ Six independent modules. Each section below is one panel in the sidebar.
 
 It creates an empty mesh in the same collection, draws it in front of the
 sculpt, adds a Shrinkwrap modifier onto the sculpt with Display on Cage, turns
-on Face Project snapping and auto-merge, and leaves you in Edit mode.
+on Face Project snapping, and leaves you in Edit mode.
 
 #### Pressing it again
 
@@ -84,11 +84,10 @@ fact rather than undoing and starting over.
 | **Mirror** | Adds a Mirror modifier **above** the shrinkwrap — so the mirrored half projects too — with Clipping on, and turns on the mesh's X symmetry. Turning it back off removes it again. |
 | **Seed From Selection** | Starts the mesh from a copy of the sculpt's selected faces instead of empty. Nothing selected just means you start empty. Skipped when it's returning you to a mesh you already have, since that would drop a duplicate on top of your work. |
 | **Snapping** | On by default. Turn it off to leave your snap settings alone. |
-| **Auto Merge** | On by default. Welds vertices dropped on top of each other. |
+| **Auto Merge** | Welds vertices dropped on top of each other. Off unless you ask. |
 
-Snapping and auto-merge are scene settings, and the operator doesn't put them
-back — same as changing them yourself. Ctrl+Z, or the header, if you want them
-back.
+Both are scene settings, and the operator doesn't put them back — same as
+changing them yourself. Ctrl+Z, or the header, if you want them back.
 
 ---
 

@@ -82,7 +82,7 @@ class TK_OT_retopo_setup(bpy.types.Operator):
     auto_merge: bpy.props.BoolProperty(
         name="Auto Merge",
         description="Weld vertices dropped on top of each other",
-        default=True,
+        default=False,
     )
 
     @classmethod

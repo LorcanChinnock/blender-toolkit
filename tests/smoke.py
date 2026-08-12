@@ -107,15 +107,18 @@ def test_retopo_tool_settings_optional():
     tool_settings = bpy.context.scene.tool_settings
     was_snapping = tool_settings.use_snap
 
-    assert bpy.ops.tk.retopo_setup(
-        set_snapping=False, auto_merge=False
-    ) == {'FINISHED'}
+    # Snapping is armed by default; auto-merge has to be asked for.
+    assert bpy.ops.tk.retopo_setup(set_snapping=False) == {'FINISHED'}
     assert tool_settings.use_snap == was_snapping
     assert not tool_settings.use_mesh_automerge
     bpy.ops.object.mode_set(mode='OBJECT')
 
     assert bpy.ops.tk.retopo_setup() == {'FINISHED'}
     assert tool_settings.use_snap
+    assert not tool_settings.use_mesh_automerge
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    assert bpy.ops.tk.retopo_setup(auto_merge=True) == {'FINISHED'}
     assert tool_settings.use_mesh_automerge
     bpy.ops.object.mode_set(mode='OBJECT')
 
