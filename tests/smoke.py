@@ -293,14 +293,21 @@ def _offset(key, index):
     return key.data[index].co.z - key.relative_key.data[index].co.z
 
 
+def _split_by_group(**kwargs):
+    return bpy.ops.tk.split_shapekey(mask_from='GROUP', **kwargs)
+
+
 def test_split_shapekey():
     reset()
     obj = _grid_with_key("Smile")
     keys = obj.data.shape_keys.key_blocks
 
-    raises(bpy.ops.tk.split_shapekey, "Missing vertex group")
-    assert _band(obj, "Left", "Right", (-1, 0, 0), (1, 0, 0)) == {'FINISHED'}
-    assert bpy.ops.tk.split_shapekey() == {'FINISHED'}
+    raises(_split_by_group, "No vertex group named", group="Left")
+    # Only one group is written: the other half is whatever is left over.
+    assert bpy.ops.tk.write_gradient(
+        source='KEEP', start=(-1, 0, 0), end=(1, 0, 0), group_name="Left"
+    ) == {'FINISHED'}
+    assert _split_by_group(group="Left") == {'FINISHED'}
 
     # The mask is baked into the coordinates, not left as a live group.
     assert keys["Smile_L"].vertex_group == ""
@@ -312,13 +319,466 @@ def test_split_shapekey():
         assert abs(_offset(keys["Smile_R"], vert.index) - (1.0 - weight)) < 1e-5
 
     # Named key rather than the active one, and drop the source afterwards.
-    assert bpy.ops.tk.split_shapekey(
-        key="Smile_L", suffix_a="_Up", suffix_b="_Lo", keep_source=False
+    assert _split_by_group(
+        key="Smile_L", group="Left", suffix_a="_Up", suffix_b="_Lo",
+        keep_source=False,
     ) == {'FINISHED'}
     assert "Smile_L" not in keys
     assert "Smile_L_Up" in keys
 
     raises(bpy.ops.tk.split_shapekey, "No shapekey named", key="Nope")
+
+
+def test_split_errors():
+    reset()
+    obj = _grid_with_key("Smile")
+
+    raises(bpy.ops.tk.split_shapekey, "is a base key", key="Basis")
+    raises(_split_by_group, "No vertex group named", group="Nope")
+    raises(_split_by_group, "No vertex group named", group="")
+    raises(bpy.ops.tk.split_shapekey, "suffixes have to differ", suffix_a="_X",
+           suffix_b="_X")
+    # Nothing was written by any of those.
+    assert [k.name for k in obj.data.shape_keys.key_blocks] == ["Basis", "Smile"]
+
+
+def test_split_axis():
+    """No vertex group anywhere: the mask comes from a plane through the origin."""
+    reset()
+    obj = _grid_with_key("Smile")  # spans -1..1 on both X and Y
+    keys = obj.data.shape_keys.key_blocks
+
+    # Hard split. Suffix A takes the high side of the axis, and the row sitting
+    # exactly on the plane is halved - the only answer that keeps the two sides
+    # adding back up to the key they came from.
+    assert bpy.ops.tk.split_shapekey() == {'FINISHED'}
+    assert sum(1 for v in obj.data.vertices if v.co.x == 0.0) == 11
+    for vert in obj.data.vertices:
+        whole = 0.5 if vert.co.x == 0.0 else float(vert.co.x > 0)
+        assert abs(_offset(keys["Smile_L"], vert.index) - whole) < 1e-6
+        assert abs(_offset(keys["Smile_R"], vert.index) - (1.0 - whole)) < 1e-6
+
+    # A band as wide as the mesh is a straight ramp across the whole thing.
+    assert bpy.ops.tk.split_shapekey(
+        key="Smile", width=2.0, suffix_a="_A", suffix_b="_B"
+    ) == {'FINISHED'}
+    for vert in obj.data.vertices:
+        ramp = (vert.co.x + 1.0) / 2.0
+        assert abs(_offset(keys["Smile_A"], vert.index) - ramp) < 1e-5
+
+    # The offset moves the plane along the axis.
+    assert bpy.ops.tk.split_shapekey(
+        key="Smile", axis='Y', offset=0.5, suffix_a="_C", suffix_b="_D"
+    ) == {'FINISHED'}
+    for vert in obj.data.vertices:
+        whole = 1.0 if vert.co.y > 0.5 else 0.0
+        assert abs(_offset(keys["Smile_C"], vert.index) - whole) < 1e-6
+
+    # A profile bends the ramp but must not cost the split its exactness.
+    assert bpy.ops.tk.split_shapekey(
+        key="Smile", width=2.0, profile='SPHERE', suffix_a="_E", suffix_b="_F"
+    ) == {'FINISHED'}
+    for vert in obj.data.vertices:
+        halves = _offset(keys["Smile_E"], vert.index) + _offset(
+            keys["Smile_F"], vert.index
+        )
+        assert abs(halves - _offset(keys["Smile"], vert.index)) < 1e-6, halves
+
+
+def test_split_selection():
+    reset()
+    obj = _grid_with_key("Smile")
+    keys = obj.data.shape_keys.key_blocks
+
+    raises(bpy.ops.tk.split_shapekey, "Select the vertices", mask_from='SELECTION')
+
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
+    raises(bpy.ops.tk.split_shapekey, "Select the vertices", mask_from='SELECTION')
+
+    bpy.ops.object.mode_set(mode='EDIT')
+    bm = bmesh.from_edit_mesh(obj.data)
+    for vert in bm.verts:
+        # select_set and a flush, not `vert.select = ...`: without the flush the
+        # edges and faces keep the selection they had, and the next time Edit
+        # mode is entered it is flushed back down over the vertices.
+        vert.select_set(vert.co.x > 0)
+    bm.select_flush_mode()
+    bmesh.update_edit_mesh(obj.data)
+    assert bpy.ops.tk.split_shapekey(mask_from='SELECTION') == {'FINISHED'}
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    for vert in obj.data.vertices:
+        whole = 1.0 if vert.co.x > 0 else 0.0
+        assert abs(_offset(keys["Smile_L"], vert.index) - whole) < 1e-6
+        assert abs(_offset(keys["Smile_R"], vert.index) - (1.0 - whole)) < 1e-6
+
+    # Smoothing turns the hard seam into a ramp, without moving the far sides.
+    assert bpy.ops.tk.split_shapekey(
+        key="Smile", mask_from='SELECTION', smooth_repeat=4,
+        suffix_a="_A", suffix_b="_B",
+    ) == {'FINISHED'}
+    middle = [v for v in obj.data.vertices if abs(v.co.x) <= 0.2]
+    assert any(0.01 < _offset(keys["Smile_A"], v.index) < 0.99 for v in middle)
+    for vert in obj.data.vertices:
+        halves = _offset(keys["Smile_A"], vert.index) + _offset(
+            keys["Smile_B"], vert.index
+        )
+        assert abs(halves - 1.0) < 1e-6, halves
+
+
+def _raise(*_args, **_kwargs):
+    raise RuntimeError("timer callbacks must survive this")
+
+
+def _mask_colours(obj):
+    """The mask attribute as one RGBA tuple per vertex, or None."""
+    from blender_toolkit.tools.shapekeys import preview
+
+    attribute = obj.data.color_attributes.get(preview.ATTRIBUTE)
+    return None if attribute is None else [tuple(d.color) for d in attribute.data]
+
+
+def test_split_preview():
+    """The A half is shown alone, and the mask goes on the mesh as colours."""
+    from blender_toolkit.tools.shapekeys import preview
+    from blender_toolkit.tools.weights.gradient import weight_paint_colour
+
+    reset()
+    preview.clear()
+    obj = _grid_with_key("Smile")
+    keys = obj.data.shape_keys.key_blocks
+
+    assert bpy.ops.tk.split_shapekey(width=1.0) == {'FINISHED'}
+    assert keys["Smile"].value == 0.0
+    assert keys["Smile_L"].value == 1.0
+    assert keys["Smile_R"].value == 0.0
+    assert obj.active_shape_key.name == "Smile_L"
+
+    # Blender renders the attribute; the mask is only ever written into it.
+    colours = _mask_colours(obj)
+    assert colours is not None and len(colours) == len(obj.data.vertices)
+    assert obj.data.color_attributes.active_color.name == preview.ATTRIBUTE
+    for vert in obj.data.vertices:
+        expected = weight_paint_colour(_offset(keys["Smile_L"], vert.index))
+        # Byte colour, so a stop is quantised to 1/255 on the way in.
+        assert all(
+            abs(a - b) < 0.01 for a, b in zip(colours[vert.index][:3], expected)
+        ), (vert.index, colours[vert.index], expected)
+
+    # Show Mask off writes no attribute. The A half is still shown on its own,
+    # and the record Done restores from is still kept.
+    reset()
+    preview.clear()
+    obj = _grid_with_key("Smile")
+    keys = obj.data.shape_keys.key_blocks
+    assert bpy.ops.tk.split_shapekey(show_mask=False) == {'FINISHED'}
+    assert keys["Smile"].value == 0.0
+    assert keys["Smile_L"].value == 1.0
+    assert keys["Smile_R"].value == 0.0
+    assert obj.active_shape_key.name == "Smile_L"
+    assert _mask_colours(obj) is None
+    assert preview.stored() is not None
+    assert bpy.ops.tk.finish_split() == {'FINISHED'}
+    assert keys["Smile_L"].value == 0.0
+
+
+def test_weight_paint_colours():
+    """Blender's own ramp: blue, cyan, green, yellow, red, dark end to bright."""
+    from blender_toolkit.tools.weights.gradient import weight_paint_colour
+
+    stops = {
+        0.0: (0.0, 0.0, 0.5),      # dark blue, not a vivid one
+        0.25: (0.0, 0.625, 0.625),  # cyan
+        0.5: (0.0, 0.75, 0.0),      # green
+        0.75: (0.875, 0.875, 0.0),  # yellow
+        1.0: (1.0, 0.0, 0.0),       # red
+    }
+    for weight, expected in stops.items():
+        got = weight_paint_colour(weight)
+        assert all(abs(a - b) < 1e-6 for a, b in zip(got, expected)), (weight, got)
+
+    # The warm half is the part an alpha fade used to eat: orange has to sit
+    # between yellow and red, with red rising and green falling.
+    orange = weight_paint_colour(0.875)
+    assert orange[0] > 0.9 and 0.3 < orange[1] < 0.6 and orange[2] == 0.0, orange
+
+    # Brightness climbs with weight, so the cold end reads dark and the warm end
+    # vivid - the whole reason this is not weight_colour under another name.
+    assert max(weight_paint_colour(0.0)) < max(weight_paint_colour(1.0))
+    assert weight_paint_colour(-1.0) == weight_paint_colour(0.0)
+    assert weight_paint_colour(2.0) == weight_paint_colour(1.0)
+
+
+def test_split_finish():
+    """Done puts the preview away and leaves the keys it made."""
+    from blender_toolkit.tools.shapekeys import preview
+
+    reset()
+    # reset() reloads the file, which says nothing about module state - an
+    # earlier split in this session has left a preview behind.
+    preview.clear()
+    obj = _grid_with_key("Smile")
+    keys = obj.data.shape_keys.key_blocks
+
+    assert bpy.ops.tk.finish_split.poll() is False  # nothing to finish yet
+    keys["Smile"].value = 0.7
+    assert bpy.ops.tk.split_shapekey(width=1.0) == {'FINISHED'}
+    assert bpy.ops.tk.finish_split.poll() is True
+    assert _mask_colours(obj) is not None
+
+    assert bpy.ops.tk.finish_split() == {'FINISHED'}
+    # The attribute comes off the mesh - it would otherwise reach the export.
+    assert _mask_colours(obj) is None
+    assert preview.stored() is None
+    assert bpy.ops.tk.finish_split.poll() is False
+
+    # The sliders are back where the user had them, and both halves are off.
+    assert abs(keys["Smile"].value - 0.7) < 1e-6
+    assert keys["Smile_L"].value == 0.0
+    assert keys["Smile_R"].value == 0.0
+    # The work itself survives - Done ends the preview, it does not undo a thing.
+    for vert in obj.data.vertices:
+        halves = _offset(keys["Smile_L"], vert.index) + _offset(
+            keys["Smile_R"], vert.index
+        )
+        assert abs(halves - _offset(keys["Smile"], vert.index)) < 1e-6
+
+    # Dropping the source leaves nothing to restore, and must not raise.
+    assert bpy.ops.tk.split_shapekey(
+        key="Smile_L", keep_source=False, suffix_a="_A", suffix_b="_B"
+    ) == {'FINISHED'}
+    assert bpy.ops.tk.finish_split() == {'FINISHED'}
+    assert "Smile_L" not in keys
+    assert keys["Smile_L_A"].value == 0.0
+
+
+def test_split_preview_restores_shading():
+    """Every viewport goes back to the shading it had before the split."""
+    from blender_toolkit.tools.shapekeys import preview
+
+    reset()
+    preview.clear()
+    obj = _grid_with_key("Smile")
+
+    # Captured after reset(): reading factory settings rebuilds the screen.
+    shadings = [shading for _address, shading in preview._viewports()]
+    assert shadings, "background Blender should still have a 3D viewport"
+    for shading in shadings:
+        shading.color_type = 'OBJECT'
+
+    assert bpy.ops.tk.split_shapekey(width=1.0) == {'FINISHED'}
+    assert all(s.color_type == preview.SHADING for s in shadings)
+
+    # Every redo-panel tweak re-runs the split. The remembered mode has to
+    # survive that rather than drifting to the one the last run set.
+    assert bpy.ops.tk.split_shapekey(
+        key="Smile", width=0.5, suffix_a="_A", suffix_b="_B"
+    ) == {'FINISHED'}
+    assert all(s.color_type == preview.SHADING for s in shadings)
+
+    assert bpy.ops.tk.finish_split() == {'FINISHED'}
+    assert all(s.color_type == 'OBJECT' for s in shadings)
+    assert _mask_colours(obj) is None
+
+    # Show Mask off never touches the viewport in the first place.
+    assert bpy.ops.tk.split_shapekey(
+        key="Smile", show_mask=False, suffix_a="_C", suffix_b="_D"
+    ) == {'FINISHED'}
+    assert all(s.color_type == 'OBJECT' for s in shadings)
+    preview.clear()
+    assert all(s.color_type == 'OBJECT' for s in shadings)
+
+
+def test_split_preview_ends_on_attention():
+    """Selecting elsewhere or changing mode ends it, with no operator involved.
+
+    Selection and view navigation push no undo step, so nothing operator-shaped
+    ever reports them. This is all the teardown there is.
+    """
+    from blender_toolkit.tools.shapekeys import preview
+
+    for moving_on in ("deselect", "other object", "mode"):
+        reset()
+        preview.clear()
+        obj = _grid_with_key("Smile")
+        other = add_cube("Other")
+        bpy.context.view_layer.objects.active = obj
+        bpy.ops.object.select_all(action='DESELECT')
+        obj.select_set(True)
+
+        assert bpy.ops.tk.split_shapekey(width=1.0) == {'FINISHED'}
+        assert _mask_colours(obj) is not None
+        assert preview.moved_on() is False, moving_on
+
+        if moving_on == "deselect":
+            obj.select_set(False)
+        elif moving_on == "other object":
+            other.select_set(True)
+        else:
+            bpy.ops.object.mode_set(mode='EDIT')
+
+        assert preview.moved_on() is True, moving_on
+        assert preview._poll() == preview.INTERVAL
+        assert _mask_colours(obj) is None, moving_on
+        assert preview.stored() is None, moving_on
+        if moving_on == "mode":
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+
+def test_split_preview_purges_strays():
+    """A preview the session no longer remembers still has to be cleaned up.
+
+    The attribute is mesh data and the shading is saved in the file, but the
+    record is module memory - so quitting mid-preview strands both, and a
+    restart used to make a stuck tint permanent instead of fixing it.
+    """
+    from blender_toolkit.tools.shapekeys import preview
+
+    reset()
+    preview.clear()
+    obj = _grid_with_key("Smile")
+    shadings = [shading for _address, shading in preview._viewports()]
+
+    assert bpy.ops.tk.split_shapekey(width=1.0) == {'FINISHED'}
+    assert _mask_colours(obj) is not None
+
+    # Exactly what a quit, a crash or a Reload Scripts leaves behind: the state
+    # is on the data, the record that would undo it is not.
+    preview._preview = None
+    assert preview.state()["stray_meshes"] == [obj.data.name]
+
+    assert preview.purge() == 1
+    assert _mask_colours(obj) is None
+
+    # A live preview's own mesh is not a stray. enable() defers a purge to the
+    # timer, so without this the first beat after a split wipes the attribute it
+    # just wrote and leaves the record claiming to show something that is gone.
+    assert bpy.ops.tk.split_shapekey(
+        key="Smile", suffix_a="_G", suffix_b="_H"
+    ) == {'FINISHED'}
+    preview._purge_pending = True
+    assert preview._poll() == preview.INTERVAL
+    assert preview._purge_pending is False
+    assert _mask_colours(obj) is not None, "the live preview must be spared"
+    assert preview.purge() == 0
+    preview.clear()
+    assert all(s.color_type != preview.SHADING for s in shadings)
+    assert preview.purge() == 0  # and nothing to do on a clean file
+
+    # Saving must never write one into the file to begin with.
+    assert bpy.ops.tk.split_shapekey(
+        key="Smile", suffix_a="_A", suffix_b="_B"
+    ) == {'FINISHED'}
+    assert _mask_colours(obj) is not None
+    preview._on_save(None)
+    assert _mask_colours(obj) is None
+    assert preview.stored() is None
+
+    # Loading forgets the previous file's preview and cleans the new one.
+    assert bpy.ops.tk.split_shapekey(
+        key="Smile", suffix_a="_C", suffix_b="_D"
+    ) == {'FINISHED'}
+    preview._on_load(None)
+    assert preview.stored() is None
+    assert _mask_colours(obj) is None
+
+    assert preview._on_load in bpy.app.handlers.load_post
+    assert preview._on_save in bpy.app.handlers.save_pre
+
+
+def test_split_preview_enable_touches_nothing():
+    """register() runs with a restricted context, so enable() must defer.
+
+    The regression: enable() purged strays directly, which reads the window
+    manager (None at register time) and writes to meshes. Raising there aborts
+    the add-on's registration partway, and the next attempt reports "already
+    registered as a subclass 'TK_AddonPreferences'".
+    """
+    from blender_toolkit.tools.shapekeys import preview
+
+    reset()
+    preview.clear()
+    obj = _grid_with_key("Smile")
+    assert bpy.ops.tk.split_shapekey(width=1.0) == {'FINISHED'}
+    preview._preview = None  # a stray, as a quit mid-preview would leave
+
+    preview.enable()
+    assert preview._purge_pending is True
+    assert _mask_colours(obj) is not None, "enable() must not touch the data"
+
+    # The timer's first beat is where the work actually happens.
+    assert preview._poll() == preview.INTERVAL
+    assert preview._purge_pending is False
+    assert _mask_colours(obj) is None
+
+    # And the cycle the error message came from has to survive repeating.
+    for cycle in range(2):
+        blender_toolkit.unregister()
+        blender_toolkit.register()
+        # AddonPreferences subclasses are not on bpy.types by name, same as
+        # gizmo groups - this lookup is what actually tracks one.
+        assert bpy.types.AddonPreferences.bl_rna_get_subclass_py(
+            "TK_AddonPreferences"
+        ) is not None, cycle
+    assert bpy.ops.tk.split_shapekey(width=1.0) == {'FINISHED'}
+    preview.clear()
+
+
+def test_split_preview_tidies_up():
+    """The timer takes the attribute off once the redo panel has gone."""
+    from blender_toolkit.tools.shapekeys import preview
+
+    reset()
+    preview.clear()
+    obj = _grid_with_key("Smile")
+
+    assert bpy.ops.tk.split_shapekey(width=1.0) == {'FINISHED'}
+    assert _mask_colours(obj) is not None
+
+    # A second split replaces the first's attribute rather than stacking one.
+    assert bpy.ops.tk.split_shapekey(
+        key="Smile", width=0.5, suffix_a="_A", suffix_b="_B"
+    ) == {'FINISHED'}
+    assert len([a for a in obj.data.color_attributes if a.name == preview.ATTRIBUTE]) == 1
+
+    # The timer is the unprompted cleanup, and it leaves the preview alone
+    # until the user's attention moves.
+    assert preview.moved_on() is False
+    assert preview._poll() == preview.INTERVAL
+    assert _mask_colours(obj) is not None
+
+    keys = obj.data.shape_keys.key_blocks
+    keys["Smile_A"].value = 0.5  # a slider dragged is the user moving on
+    assert preview.moved_on() is True
+    assert preview._poll() == preview.INTERVAL
+    assert _mask_colours(obj) is None
+    assert preview.stored() is None
+    assert preview._poll() == preview.INTERVAL  # and does nothing with none left
+
+    # A timer that raises is unregistered by Blender, and then nothing ever
+    # tidies the attribute away. It has to survive anything.
+    assert bpy.ops.tk.split_shapekey(key="Smile", suffix_a="_E", suffix_b="_F") == {
+        'FINISHED'
+    }
+    broken, preview.moved_on = preview.moved_on, _raise
+    try:
+        assert preview._poll() == preview.INTERVAL
+    finally:
+        preview.moved_on = broken
+    preview.clear()
+
+    # An attribute the user already had is put back as the active one.
+    reset()
+    preview.clear()
+    obj = _grid_with_key("Smile")
+    mine = obj.data.color_attributes.new(name="Mine", type='BYTE_COLOR', domain='POINT')
+    assert obj.data.color_attributes.active_color.name == mine.name
+    assert bpy.ops.tk.split_shapekey(width=1.0) == {'FINISHED'}
+    assert obj.data.color_attributes.active_color.name == preview.ATTRIBUTE
+    preview.clear()
+    assert obj.data.color_attributes.active_color.name == "Mine"
+    assert _mask_colours(obj) is None
 
 
 def test_split_chain():
@@ -330,10 +790,9 @@ def test_split_chain():
     _band(obj, "Left", "Right", (-1, 0, 0), (1, 0, 0))
     _band(obj, "Upper", "Lower", (0, -1, 0), (0, 1, 0))
 
-    assert bpy.ops.tk.split_shapekey() == {'FINISHED'}
-    assert bpy.ops.tk.split_shapekey(
-        key="Full_L", group_a="Upper", group_b="Lower",
-        suffix_a="_Up", suffix_b="_Lo",
+    assert _split_by_group(group="Left") == {'FINISHED'}
+    assert _split_by_group(
+        key="Full_L", group="Upper", suffix_a="_Up", suffix_b="_Lo",
     ) == {'FINISHED'}
 
     for vert in obj.data.vertices:
@@ -349,10 +808,7 @@ def test_split_chain():
     assert abs(_offset(keys["Full_L_Up"], corner.index)) < 1e-6
 
     # The four quadrant keys must still reconstruct the original.
-    bpy.ops.tk.split_shapekey(
-        key="Full_R", group_a="Upper", group_b="Lower",
-        suffix_a="_Up", suffix_b="_Lo",
-    )
+    _split_by_group(key="Full_R", group="Upper", suffix_a="_Up", suffix_b="_Lo")
     quadrants = ("Full_L_Up", "Full_L_Lo", "Full_R_Up", "Full_R_Lo")
     for vert in obj.data.vertices:
         total = sum(_offset(keys[q], vert.index) for q in quadrants)
@@ -2129,10 +2585,25 @@ def test_load_submodules():
 
 
 def test_unregister_is_clean():
+    from blender_toolkit.tools.shapekeys import preview
     from blender_toolkit.tools.weights import overlay
+
+    # A preview left running must not survive the add-on going away: the colour
+    # attribute is on the user's mesh and the viewport is left recoloured.
+    reset()
+    obj = _grid_with_key("Smile")
+    assert bpy.ops.tk.split_shapekey(width=1.0) == {'FINISHED'}
+    shadings = [shading for _address, shading in preview._viewports()]
+    assert _mask_colours(obj) is not None
 
     blender_toolkit.unregister()
     try:
+        assert preview.stored() is None
+        assert _mask_colours(obj) is None
+        assert all(s.color_type != preview.SHADING for s in shadings)
+        assert preview._timer is None
+        assert preview._on_load not in bpy.app.handlers.load_post
+        assert preview._on_save not in bpy.app.handlers.save_pre
         assert not hasattr(bpy.types.Object, "tk_gradient")
         assert overlay._handler is None
         assert not bpy.app.timers.is_registered(overlay._sync)
@@ -2146,10 +2617,14 @@ def test_unregister_is_clean():
         assert not hasattr(bpy.types, "TK_PG_weight_gradient")
         for name in (
             "TK_PT_retopo", "TK_PT_mesh", "TK_PT_shapekeys", "TK_PT_weights",
-            "TK_PT_rigging", "TK_PT_export",
-            "TK_MT_pie_main", "TK_AddonPreferences",
+            "TK_PT_rigging", "TK_PT_export", "TK_MT_pie_main",
         ):
             assert not hasattr(bpy.types, name), name
+        # Not in that loop: an AddonPreferences subclass is never on bpy.types
+        # by name whether it is registered or not, so hasattr could not fail.
+        assert bpy.types.AddonPreferences.bl_rna_get_subclass_py(
+            "TK_AddonPreferences"
+        ) is None
         assert (not hasattr(bpy.ops.tk, "retopo_setup")
                 or "tk.retopo_setup" not in dir(bpy.ops.tk))
     finally:

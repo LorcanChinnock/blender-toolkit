@@ -219,6 +219,58 @@ old ones are what bpy has registered.
   silently deforms at full strength. `TK_OT_split_shapekey` therefore bakes the
   weight into the coordinates — `co = relative_key.co + (source.co - relative_key.co) * w`
   — and leaves `vertex_group` empty.
+- **`context.active_operator` reads as `None` from a `bpy.app.timers` callback,
+  always.** Measured in a real GUI session, on the beat straight after a UI
+  invoke that returned `{'FINISHED'}` - not only in background Blender. So a
+  timer cannot ask what the redo panel is showing, and any "if I cannot see an
+  operator the panel must be gone" fallback fires on the very first beat: the
+  split's mask preview was destroyed 0.2 s after every split, and no amount of
+  reasoning about the UI thread would have shown it. It is also *not* "the redo
+  panel is open" even where it is readable - it is the last operator that pushed
+  an undo step, and selection and view navigation push none, which is why
+  Blender's redo panel survives clicking around. Both readings are dead ends.
+  What works is asking about the *user*: active object, mode and selection,
+  snapshotted when the preview was applied, plus the values the preview itself
+  set. Plain data, readable from any context, and testable - which
+  `active_operator` never was.
+- **A background Blender runs no timers, so a `_poll()` called by hand in a test
+  proves only the arithmetic.** The context it sees is the caller's. To observe
+  what a timer really sees, drive a GUI Blender from a script that registers its
+  own timer, writes findings to a file and calls `wm.quit_blender()`; both
+  `active_operator` facts above came from that and from nothing else.
+- **Temporary state on a datablock outlives the module variable tracking it.**
+  A colour attribute is mesh data and `View3DShading.color_type` is saved in the
+  file; the record saying "put these back" was a module global. Quitting,
+  crashing or reloading scripts mid-preview stranded both with nothing left to
+  undo them, so *restarting made a stuck preview permanent instead of clearing
+  it*, and every later session stranded another. Anything written outside the
+  add-on's own memory needs a teardown that does not depend on that memory: a
+  `purge()` that finds the state by its own name prefix, called from
+  `register()` and from a `@persistent load_post`, plus `save_pre` so the file
+  never carries it in the first place.
+- **Do not hand-draw what Blender can already render.** The split's mask preview
+  was a GPU draw handler for four rounds and got three separate things wrong:
+  it alpha-blended against the viewport grey (so blue read lavender), it left
+  `blend`/`depth_test` set for every pass after it, and it built its shell from
+  base coordinates while the surface on screen was deformed by the very shape
+  key being previewed - so it survived only as a coloured fringe around the
+  silhouette. What replaced all of it is a `BYTE_COLOR` point attribute plus
+  `View3DShading.color_type = 'VERTEX'`: Blender lights it, depth-sorts it and
+  follows the modifier stack for nothing. Byte, not float - byte colour
+  attributes are sRGB, which is the space weight colours are written in.
+  Weight Paint mode would be more native still and cannot be used here:
+  `object.mode_set` is an operator, and running one replaces the redo panel the
+  tool is being adjusted from.
+- **`ShapeKey.data` takes `foreach_get`/`foreach_set` on `"co"`**, so a whole-key
+  bake is two C calls and a numpy expression rather than a per-vertex loop.
+  Measured: a split of a 65k-vertex mesh is 57 ms end to end, falloff included.
+- **Setting `BMVert.select` directly does not survive leaving and re-entering
+  Edit mode.** The edges and faces keep the selection they had, and entering
+  Edit mode flushes that back down over the vertices - so a selection set that
+  way reads correct once and then reverts. `select_set()` plus
+  `bm.select_flush_mode()` before `update_edit_mesh` is what sticks. Mesh-level
+  `vertices.foreach_get("select", ...)` after the mode switch is then exact, and
+  needs no BMesh copy-out.
 - `VertexGroup.weight(index)` raises for vertices outside the group. Read
   memberships off the mesh instead: `{g.group: g.weight for g in vert.groups}`.
 - BMesh elements die on a mode switch, same as `edit_bones`. Copy out indices
@@ -350,6 +402,20 @@ old ones are what bpy has registered.
   Blender already keeps. The panel names the active group and works on it. The
   cost, accepted: nothing marks which groups are gradient-driven, because
   Blender's own list is not ours to draw into.
+- **`register()` runs with a restricted context** - no window manager, and data
+  not safe to write. Anything a module's `register()` calls has to obey that: a
+  stray-cleanup pass that read `context.window_manager` and wrote to meshes
+  raised from `preview.enable()`, which aborted the add-on's registration
+  partway and made every later attempt report `register_class(...): already
+  registered as a subclass 'TK_AddonPreferences'` - an error naming a class that
+  had nothing to do with the fault. Defer that work to the timer's first beat,
+  where the context is real. `unregister()` is restricted on shutdown too, so
+  handlers and timers must come off whatever the data does.
+- **`AddonPreferences` subclasses are not on `bpy.types` by name either**, same
+  as gizmo groups below - so `assert not hasattr(bpy.types, "TK_AddonPreferences")`
+  passes whether or not it is registered. It sat in the unregister test as a
+  check that could never fail. Use
+  `bpy.types.AddonPreferences.bl_rna_get_subclass_py("TK_AddonPreferences")`.
 - Gizmo groups are **not** exposed as `bpy.types.<name>` the way panels are, and
   `bl_rna` survives `unregister_class`. To test registration use
   `bpy.types.GizmoGroup.bl_rna_get_subclass_py("TK_GGT_...")`, which is `None`

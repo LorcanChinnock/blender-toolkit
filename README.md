@@ -45,7 +45,7 @@ Six independent modules. Each section below is one panel in the sidebar.
 <!-- TOC -->
 - [Retopology](#retopology) — one-click shrinkwrap + snapping setup
 - [Mesh](#mesh) — find the geometry that will cause trouble later
-- [Shapekeys](#shapekeys) — apply modifiers without losing keys, split keys by weight
+- [Shapekeys](#shapekeys) — apply modifiers without losing keys, split keys in two
 - [Weights](#weights) — interactive vertex-group gradients
 - [Rigging](#rigging) — humanoid validation, pose toggle, twist bones
 - [Export](#export) — FBX with game-engine defaults
@@ -136,10 +136,43 @@ with the original names, values and slider ranges intact.
 
 #### Split Shapekey
 
-Splits one key into two, each weighted by one of a pair of vertex groups —
-`Name_L` and `Name_R` from `Left` and `Right` by default. The group names and
-suffixes are properties, so the same operator handles any pair
-(`Upper`/`Lower`, `_Up`/`_Lo`). Build the groups with **Weight Gradient** below.
+Splits one key into two halves — `Name_L` and `Name_R` by default. You give it
+**one** mask; the other half gets whatever is left over, so the two always add
+back up to exactly the key they came from. The suffixes are properties, so the
+same operator handles any pair (`_Up`/`_Lo`, `_Front`/`_Back`).
+
+**Mask From** picks where the mask comes from:
+
+| | |
+|---|---|
+| **Axis** | A plane through the object origin, cutting across X, Y or Z. **Offset** slides it along that axis, **Width** feathers it into a soft band, **Profile** bends the ramp. Needs nothing set up first — the default is a hard left/right split. |
+| **Vertex Group** | The group's weights are the mask. Paint it, or build it with **Weight Gradient** below. |
+| **Selection** | The vertices selected in Edit Mode. Hard-edged by design; **Smooth** softens the seam. |
+
+Suffix A goes on the side the mask covers — for an axis split that is the high
+end (`+X` for X), which is the side Blender's own `.L` convention means. A vertex
+sitting exactly on the plane is halved between the two.
+
+**It runs straight away and you adjust it in F9**, like Subdivide or Bevel. The
+settings live in the redo panel, and every change re-runs the split so you watch
+the seam move. While that panel is open the viewport shows the A half on its own,
+with the mask coloured onto the mesh the way weight paint would — blue where the
+half is empty, red where it is whole. **Show Mask** turns that off when it is in
+the way; the half is still shown on its own.
+
+The colours are a temporary colour attribute plus Solid shading's
+**Color = Attribute**, so Blender draws them — which is why they light and sort
+like the rest of the mesh. Both are put back by **Done**, and by a timer if the
+panel goes some other way. It needs **Solid** viewport shading to be visible.
+
+Press **Done** when the seam is right. It ends the preview, puts the key sliders
+back where you had them and dismisses the panel — which is the only way to close
+one, since Blender replaces a redo panel rather than closing it.
+
+The preview also ends on its own as soon as your attention moves: selecting
+something else, deselecting, changing mode, dragging any of the key sliders, or
+running another operator. Orbiting to inspect the seam deliberately does not end
+it.
 
 Weights are **baked into the coordinates**, not left as a live
 `ShapeKey.vertex_group` mask. A key only holds one mask group, so a live mask
@@ -150,9 +183,9 @@ vertex-group dependency into the exported FBX.
 
 *Trade-off:* repainting a group no longer updates the key — re-run the split.
 
-**Four quadrants** = two runs. Split by `Left`/`Right`, then split each result by
-`Upper`/`Lower`. The four keys sum back to the original. Turn off **Keep Source**
-on the second pass to drop the intermediates.
+**Four quadrants** = two runs, no vertex groups at all. Split on **X**, then
+split each result on **Y**. The four keys sum back to the original. Turn off
+**Keep Source** on the second pass to drop the intermediates.
 
 ---
 

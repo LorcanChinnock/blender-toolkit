@@ -1,6 +1,15 @@
 import bpy
 
 from ...utils import ensure_mode
+# The falloff maths, borrowed rather than restated: an axis split is a two-point
+# linear gradient, which `gradient` already computes for a whole mesh at once.
+# It is imported at module level rather than lazily because a property's enum
+# items are needed when the class body runs. MODULE_NAMES lists shapekeys before
+# weights, so on Reload Scripts this resolves against the session's cached copy
+# of gradient - harmless here, because everything used off it is reached as an
+# attribute, which cannot raise ImportError the way a renamed class would.
+from ..weights import gradient
+from . import preview
 
 
 def _activate(context, obj):
@@ -112,10 +121,15 @@ class TK_OT_apply_modifiers_shapekeys(bpy.types.Operator):
 
 
 class TK_OT_split_shapekey(bpy.types.Operator):
-    """Split a shapekey into two, each weighted by one of a pair of vertex groups
+    """Split a shapekey into two halves, weighted by a mask and its complement
 
-    The weights are baked into the coordinates rather than left as a live
-    ShapeKey.vertex_group mask, so the results can be split again.
+    One mask goes in and two keys come out, the second weighted 1 - w, so the
+    halves always add back up to the key they came from. The weights are baked
+    into the coordinates rather than left as a live ShapeKey.vertex_group mask,
+    which holds one group and cannot stack - so the results can be split again.
+
+    Suffix A goes on the half the mask covers. Along an axis that is the high
+    end: +X for X, which is the side Blender's own .L convention means.
     """
 
     bl_idname = "tk.split_shapekey"
@@ -126,13 +140,55 @@ class TK_OT_split_shapekey(bpy.types.Operator):
         name="Shapekey",
         description="Key to split. Empty uses the active one",
     )
-    group_a: bpy.props.StringProperty(name="Group A", default="Left")
-    group_b: bpy.props.StringProperty(name="Group B", default="Right")
+    mask_from: bpy.props.EnumProperty(
+        name="Mask From",
+        items=[
+            ('AXIS', "Axis", "Split across a plane through the object origin"),
+            ('GROUP', "Vertex Group", "Split by the weights of a vertex group"),
+            ('SELECTION', "Selection", "Split by the selected vertices"),
+        ],
+        default='AXIS',
+    )
+    axis: bpy.props.EnumProperty(
+        name="Axis",
+        description="Axis the split plane cuts across",
+        items=[(a, a, "") for a in ('X', 'Y', 'Z')],
+        default='X',
+    )
+    offset: bpy.props.FloatProperty(
+        name="Offset",
+        description="Move the plane along the axis from the object origin",
+        default=0.0, subtype='DISTANCE',
+    )
+    width: bpy.props.FloatProperty(
+        name="Width",
+        description="Width of the soft band across the plane. Zero splits hard",
+        default=0.0, min=0.0, subtype='DISTANCE',
+    )
+    profile: bpy.props.EnumProperty(
+        name="Profile", items=gradient.PROFILES, default='LINEAR'
+    )
+    group: bpy.props.StringProperty(
+        name="Group",
+        description="Group whose weights mask the split. The other half gets "
+                    "what is left over",
+    )
+    smooth_repeat: bpy.props.IntProperty(
+        name="Smooth",
+        description="Average the mask with its neighbours, softening the seam",
+        default=0, min=0, max=20,
+    )
     suffix_a: bpy.props.StringProperty(name="Suffix A", default="_L")
     suffix_b: bpy.props.StringProperty(name="Suffix B", default="_R")
     keep_source: bpy.props.BoolProperty(
         name="Keep Source",
         description="Leave the key that was split in place",
+        default=True,
+    )
+    show_mask: bpy.props.BoolProperty(
+        name="Show Mask",
+        description="Tint the mesh by the mask, in weight paint's colours. The "
+                    "A half is shown on its own either way",
         default=True,
     )
 
@@ -149,20 +205,108 @@ class TK_OT_split_shapekey(bpy.types.Operator):
         )
 
     def invoke(self, context, event):
-        return context.window_manager.invoke_props_dialog(self)
+        # Runs straight away and leaves the settings to the redo panel, the way
+        # Subdivide, Bevel and Separate all do. A props dialog owns the input
+        # while it is open, so nothing it changes can be seen in the viewport -
+        # and being able to watch the seam move is the point.
+        #
+        # The key is named rather than left empty so the redo panel says which
+        # one is being split. Empty still means the active one for a scripted
+        # call, which is what keeps that default worth having.
+        active = context.active_object.active_shape_key
+        if not self.key and active is not None:
+            self.key = active.name
+        return self.execute(context)
 
     def draw(self, context):
         obj = context.active_object
         layout = self.layout
         layout.use_property_split = True
         layout.prop_search(self, "key", obj.data.shape_keys, "key_blocks")
-        layout.prop_search(self, "group_a", obj, "vertex_groups")
+        layout.separator()
+        layout.prop(self, "mask_from")
+        if self.mask_from == 'AXIS':
+            layout.prop(self, "axis")
+            layout.prop(self, "offset")
+            layout.prop(self, "width")
+            if self.width > 0.0:
+                layout.prop(self, "profile")
+        elif self.mask_from == 'GROUP':
+            layout.prop_search(self, "group", obj, "vertex_groups")
+        layout.prop(self, "smooth_repeat")
+        layout.separator()
         layout.prop(self, "suffix_a")
-        layout.prop_search(self, "group_b", obj, "vertex_groups")
         layout.prop(self, "suffix_b")
         layout.prop(self, "keep_source")
+        layout.prop(self, "show_mask")
+        layout.separator()
+        layout.operator(TK_OT_finish_split.bl_idname, icon='CHECKMARK')
+
+    def _mask(self, obj):
+        """The weight of every vertex in the half that gets suffix A.
+
+        Returns (weights, error). Called in Object mode, so an Edit-mode
+        selection has already been flushed onto the mesh.
+        """
+        import numpy as np
+
+        mesh = obj.data
+        count = len(mesh.vertices)
+
+        if self.mask_from == 'GROUP':
+            group = obj.vertex_groups.get(self.group)
+            if group is None:
+                return None, f"No vertex group named '{self.group}'"
+            # VertexGroup.weight() raises for vertices outside the group, so read
+            # the memberships off the mesh instead.
+            weights = np.array(
+                [
+                    {g.group: g.weight for g in v.groups}.get(group.index, 0.0)
+                    for v in mesh.vertices
+                ]
+            )
+        elif self.mask_from == 'SELECTION':
+            weights = np.empty(count)
+            mesh.vertices.foreach_get("select", weights)
+            covered = weights.sum()
+            if covered == 0 or covered == count:
+                return None, (
+                    "Select the vertices that should go to "
+                    f"'{self.suffix_a}', and leave the rest unselected"
+                )
+        else:
+            coords = np.empty(count * 3)
+            mesh.vertices.foreach_get("co", coords)
+            # A hard split is a band of no width, which has no direction to ramp
+            # along - raw_factors rejects it. The floor keeps the plane exact to
+            # far more decimal places than a mesh coordinate carries.
+            span = max(self.width, 1e-6) * 0.5
+            index = "XYZ".index(self.axis)
+            low, high = [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
+            low[index], high[index] = self.offset - span, self.offset + span
+            raw = gradient.raw_factors(coords, [low, high], 'LINEAR')
+            if self.profile == 'LINEAR':
+                weights = raw  # value() is the identity for a linear profile
+            else:
+                # ponytail: scalar pass over the whole mesh. This runs once per
+                # split, not once per mouse-move like the gradient tool's own
+                # writes, so it never became worth vectorising the profiles.
+                weights = np.array(
+                    [gradient.value(t, profile=self.profile) for t in raw.tolist()]
+                )
+
+        if self.smooth_repeat:
+            smoothed = gradient.smooth(
+                dict(enumerate(weights.tolist())),
+                [tuple(e.vertices) for e in mesh.edges],
+                self.smooth_repeat,
+            )
+            weights = np.array([smoothed[i] for i in range(count)])
+        return weights, None
 
     def execute(self, context):
+        import numpy as np
+
         obj = context.active_object
         keys = obj.data.shape_keys.key_blocks
 
@@ -173,41 +317,117 @@ class TK_OT_split_shapekey(bpy.types.Operator):
         if source == source.relative_key:
             self.report({'ERROR'}, f"'{source.name}' is a base key - nothing to split")
             return {'CANCELLED'}
-
-        missing = [g for g in (self.group_a, self.group_b) if g not in obj.vertex_groups]
-        if missing:
-            self.report({'ERROR'}, f"Missing vertex group(s): {', '.join(missing)}")
+        if self.suffix_a == self.suffix_b:
+            self.report({'ERROR'}, "The two suffixes have to differ")
             return {'CANCELLED'}
 
         reference = source.relative_key
         with ensure_mode(context, 'OBJECT'):
-            # VertexGroup.weight() raises for vertices outside the group, so read
-            # the memberships off the mesh instead.
-            per_vertex = [
-                {g.group: g.weight for g in v.groups} for v in obj.data.vertices
-            ]
-            for suffix, name in (
-                (self.suffix_a, self.group_a),
-                (self.suffix_b, self.group_b),
+            weights, error = self._mask(obj)
+            if error:
+                self.report({'ERROR'}, error)
+                return {'CANCELLED'}
+
+            count = len(obj.data.vertices)
+            base = np.empty(count * 3)
+            reference.data.foreach_get("co", base)
+            offsets = np.empty(count * 3)
+            source.data.foreach_get("co", offsets)
+            offsets -= base
+
+            # 1 - w rather than gradient.value(invert=True): inverting negates
+            # the weight for exactly this reason, so the two are the same number
+            # and the subtraction is the one that says so.
+            made = []
+            for suffix, half in (
+                (self.suffix_a, weights), (self.suffix_b, 1.0 - weights)
             ):
-                group = obj.vertex_groups[name]
                 new_key = obj.shape_key_add(name=f"{source.name}{suffix}", from_mix=False)
-                for index, groups in enumerate(per_vertex):
-                    weight = groups.get(group.index, 0.0)
-                    base = reference.data[index].co
-                    new_key.data[index].co = base + (source.data[index].co - base) * weight
+                new_key.data.foreach_set("co", base + offsets * np.repeat(half, 3))
                 new_key.relative_key = reference
                 new_key.slider_min = source.slider_min
                 new_key.slider_max = source.slider_max
+                made.append(new_key)
 
+            source_name, source_value = source.name, source.value
             if not self.keep_source:
                 obj.shape_key_remove(source)
+
+            self._show(obj, weights, source_name, source_value, made)
 
         self.report(
             {'INFO'}, f"Split into {self.suffix_a} / {self.suffix_b}"
         )
         return {'FINISHED'}
 
+    def _show(self, obj, weights, source_name, source_value, made):
+        """Put the A half on screen on its own, and hand the mask to the preview.
 
-classes = (TK_OT_apply_modifiers_shapekeys, TK_OT_split_shapekey)
+        The user cannot preview this by dragging a slider themselves: every
+        change in the redo panel undoes the split and runs it again, so the keys
+        come back at zero and the drag is lost. It has to be set from here to
+        survive a tweak.
+        """
+        keys = obj.data.shape_keys.key_blocks
+        for block in keys:
+            if block.name == source_name:
+                block.value = 0.0
+        made[0].value, made[1].value = 1.0, 0.0
+        obj.active_shape_key_index = keys.find(made[0].name)
+        preview.apply(
+            obj, weights.tolist(), source_name, source_value,
+            (made[0].name, made[1].name), tint=self.show_mask,
+        )
+
+
+class TK_OT_finish_split(bpy.types.Operator):
+    """Put the split's preview away, keeping the keys it made
+
+    Blender has no call that closes a redo panel - screen.redo_last only opens
+    one, and context.active_operator is a C-side getter with no setter. What
+    replaces a redo panel is the next operator that runs, so this button is both
+    the way to end the preview and the only way to dismiss the panel holding it.
+    Without it the panel and its tint outlast any amount of orbiting, because
+    view navigation does not register as an operator.
+
+    The values the preview set are put back rather than left: it turned the
+    source key off and the A half up to show one side on its own, and that was
+    never the user's arrangement of the sliders.
+    """
+
+    bl_idname = "tk.finish_split"
+    bl_label = "Done"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return preview.stored() is not None
+
+    def execute(self, context):
+        state = preview.stored()
+        preview.clear()
+
+        obj = context.active_object
+        keys = obj.data.shape_keys if obj and obj.type == 'MESH' else None
+        if state is not None and keys is not None:
+            blocks = keys.key_blocks
+            source = blocks.get(state["source"])
+            if source is not None:
+                source.value = state["source_value"]
+            for name in state["halves"]:
+                half = blocks.get(name)
+                if half is not None:
+                    half.value = 0.0
+
+        # The tint is gone from the data; ask for the redraw that shows it.
+        screen = context.screen
+        for area in screen.areas if screen else ():
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+        return {'FINISHED'}
+
+
+classes = (
+    TK_OT_apply_modifiers_shapekeys, TK_OT_split_shapekey, TK_OT_finish_split,
+)
 

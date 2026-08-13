@@ -31,9 +31,41 @@ _BLUE_HUE = 2.0 / 3.0
 
 
 def weight_colour(value):
-    """The colour weight paint gives this weight."""
+    """Weight paint's hue at this weight, at full saturation and brightness.
+
+    The scale a ColorRamp can *be*: `weight_of` inverts it exactly, which is
+    what lets the ramp widget stand in for a weight editor. Not what weight
+    paint actually draws - see `weight_paint_colour`, which is the same hues
+    with Blender's brightness ramp on top and cannot be inverted from a stop.
+    """
     hue = (1.0 - _clamp(value)) * _BLUE_HUE
     return (*colorsys.hsv_to_rgb(hue, 1.0, 1.0), 1.0)
+
+
+def weight_paint_colour(value):
+    """What weight paint mode actually paints on the mesh, as RGB.
+
+    Blender's own blue -> cyan -> green -> yellow -> red, in four straight
+    segments with a brightness that climbs from a half at zero to full at one -
+    so the cold end is dark and the warm end is vivid. That brightness is why
+    this is not `weight_colour` with a different name, and why the pair cannot
+    be collapsed: `weight_of` needs a hue it can read back, and a stop dimmed
+    to half would come back as a different weight.
+
+    Not probed, because nothing exposes it: there is no ColorRamp for it on
+    tool_settings and no theme entry, so it lives in C where only the source
+    says what it is. This is Blender's published algorithm, and the check is to
+    put a mesh in Weight Paint next to the overlay and look.
+    """
+    weight = _clamp(value)
+    blend = weight * 0.5 + 0.5
+    if weight <= 0.25:  # blue -> cyan
+        return (0.0, blend * weight * 4.0, blend)
+    if weight <= 0.5:  # cyan -> green
+        return (0.0, blend, blend * (1.0 - (weight - 0.25) * 4.0))
+    if weight <= 0.75:  # green -> yellow
+        return (blend * (weight - 0.5) * 4.0, blend, 0.0)
+    return (blend, blend * (1.0 - (weight - 0.75) * 4.0), 0.0)  # yellow -> red
 
 
 def weight_of(colour):
