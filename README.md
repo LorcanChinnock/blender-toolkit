@@ -127,10 +127,12 @@ Blender refuses to apply a modifier to a mesh that has shapekeys. This bakes
 each key on a duplicate, applies the modifiers there, and joins everything back
 with the original names, values and slider ranges intact.
 
-> **Note** — modifiers that change vertex count (Subsurf, Mirror, Solidify, …)
-> are rejected up front with an error. Join as Shapes needs matching vertex
-> counts, and going ahead anyway would silently corrupt the keys. Apply or
-> remove those first.
+> **Note** — modifiers that add geometry are fine: Subsurf, Mirror, Solidify
+> and Array build the same topology whatever a key does, so the keys come back
+> subdivided or mirrored with them. What cannot work is a modifier that rebuilds
+> geometry *from its shape* — Weld, Decimate, Remesh, Boolean — because each key
+> then ends up with a different vertex count and there is nothing to join to.
+> Those are reported with the offending keys named, before anything is changed.
 
 #### Split Shapekey
 

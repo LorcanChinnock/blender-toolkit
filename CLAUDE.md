@@ -202,10 +202,17 @@ old ones are what bpy has registered.
 
 ## Gotchas already paid for
 
-- `bpy.ops.object.join_shapes` requires matching vertex counts. Applying a
-  topology-changing modifier to a mesh with shapekeys silently corrupts them,
-  which is why `TK_OT_apply_modifiers_shapekeys` refuses upfront via a depsgraph
-  vertex-count check.
+- **"Changes the vertex count" is not the thing that breaks `join_shapes`.**
+  It needs the *base and the donor* to match, and in
+  `TK_OT_apply_modifiers_shapekeys` both have the modifiers applied by then — so
+  Subsurf, Mirror, Solidify and Array all work, and the original depsgraph
+  "evaluated count != base count" guard rejected them for nothing. What actually
+  breaks is a modifier whose output topology depends on the *geometry* it is fed
+  (Weld's merge distance, Decimate, Remesh, Boolean): the deformed key collapses
+  a vertex the Basis keeps, and the counts diverge between keys. Probed — Weld at
+  threshold 1.2 gives 8 verts for a 0.5 offset and 7 for 1.7. The check is
+  therefore per-key and empirical: bake every key (plus a Basis copy) first,
+  compare counts, and only touch the object once they agree.
 - `ShapeKey.vertex_group` holds **one** group and masks cannot stack. A split
   that assigns it looks right but cannot be chained: splitting an already-split
   key replaces the first mask instead of intersecting it, and the discarded half
