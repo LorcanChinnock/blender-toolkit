@@ -177,21 +177,37 @@ def test_selected_geometry():
     }
 
 
-def _cube_with_keys(modifier_type):
+def _cube_with_keys(modifier_type, offset=0.5, **settings):
     obj = add_cube()
     obj.shape_key_add(name="Basis")
     for name in ("Smile", "Frown", "Blink"):
         key = obj.shape_key_add(name=name)
         key.value = 0.25
-        key.data[0].co.x += 0.5
-    obj.modifiers.new("Mod", modifier_type)
+        key.data[0].co.x += offset
+    modifier = obj.modifiers.new("Mod", modifier_type)
+    for attribute, value in settings.items():
+        setattr(modifier, attribute, value)
     return obj
 
 
-def test_apply_modifiers_rejects_topology_change():
+def test_apply_modifiers_rejects_unstable_topology():
     reset()
-    _cube_with_keys('SUBSURF')
-    raises(bpy.ops.tk.apply_modifiers_shapekeys, "change the vertex count")
+    # Weld merges by distance, so the deformed key collapses a vertex the
+    # Basis keeps and the two meshes no longer correspond.
+    _cube_with_keys('WELD', offset=1.7, merge_threshold=1.2)
+    raises(bpy.ops.tk.apply_modifiers_shapekeys, "different vertex count")
+
+
+def test_apply_modifiers_allows_topology_change():
+    reset()
+    obj = _cube_with_keys('SUBSURF')  # more vertices, same for every key
+    assert bpy.ops.tk.apply_modifiers_shapekeys() == {'FINISHED'}
+
+    keys = obj.data.shape_keys.key_blocks
+    assert [k.name for k in keys] == ["Basis", "Smile", "Frown", "Blink"]
+    assert len(obj.data.vertices) == 26
+    assert not obj.modifiers
+    assert keys["Smile"].data[0].co != keys["Basis"].data[0].co
 
 
 def test_apply_modifiers_keeps_shapekeys():
@@ -209,7 +225,7 @@ def test_apply_modifiers_keeps_shapekeys():
     # The key still carries the offset, now with the modifier baked in.
     assert keys["Smile"].data[0].co != keys["Basis"].data[0].co
     assert keys["Smile"].data[0].co != moved
-    assert not [o for o in bpy.data.objects if o.name.startswith("__tk_")]
+    assert [o.name for o in bpy.data.objects] == [obj.name]
 
 
 def _grid_with_key(name="Full", subdivisions=10):

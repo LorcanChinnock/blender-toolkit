@@ -14,6 +14,22 @@ def _apply_all_modifiers(obj):
         bpy.ops.object.modifier_apply(modifier=modifier.name)
 
 
+def _bake(context, obj, index):
+    """Duplicate obj showing only key `index`, with every modifier applied.
+
+    Index 0 is the Basis, which is what the object itself becomes.
+    """
+    _activate(context, obj)
+    bpy.ops.object.duplicate(linked=False)
+    dup = context.active_object
+    for i, key in enumerate(dup.data.shape_keys.key_blocks):
+        key.value = 1.0 if i == index else 0.0
+        key.slider_min, key.slider_max = 0.0, 1.0
+    bpy.ops.object.shape_key_remove(all=True, apply_mix=True)
+    _apply_all_modifiers(dup)
+    return dup
+
+
 class TK_OT_apply_modifiers_shapekeys(bpy.types.Operator):
     """Apply every modifier on the active object, keeping its shapekeys intact"""
 
@@ -34,20 +50,6 @@ class TK_OT_apply_modifiers_shapekeys(bpy.types.Operator):
     def execute(self, context):
         obj = context.active_object
 
-        # Join as Shapes needs matching vertex counts, so a topology-changing
-        # modifier would silently produce garbage shapekeys. Refuse instead.
-        evaluated = obj.evaluated_get(context.evaluated_depsgraph_get())
-        eval_mesh = evaluated.to_mesh()
-        topology_changed = len(eval_mesh.vertices) != len(obj.data.vertices)
-        evaluated.to_mesh_clear()
-        if topology_changed:
-            self.report(
-                {'ERROR'},
-                "Modifiers change the vertex count - shapekeys cannot survive. "
-                "Apply or remove those modifiers manually.",
-            )
-            return {'CANCELLED'}
-
         keys = obj.data.shape_keys.key_blocks
         # Skip the Basis; it becomes the base mesh once the keys are stripped.
         snapshot = [
@@ -55,18 +57,34 @@ class TK_OT_apply_modifiers_shapekeys(bpy.types.Operator):
         ]
 
         with ensure_mode(context, 'OBJECT'):
-            duplicates = []
-            for index, (name, *_rest) in enumerate(snapshot, start=1):
+            # Bake every key on its own copy first. A modifier may change the
+            # vertex count and still be fine - subsurf, mirror and solidify all
+            # produce the same topology whatever the key does. What Join as
+            # Shapes cannot survive is a count that *differs between the keys*,
+            # which is what a geometry-dependent modifier (weld, decimate,
+            # remesh, boolean) does. Nothing on the object is touched until
+            # every copy is known to agree.
+            basis = _bake(context, obj, 0)
+            duplicates = [_bake(context, obj, i) for i in range(1, len(keys))]
+
+            expected = len(basis.data.vertices)
+            disagree = [
+                name
+                for (name, *_rest), dup in zip(snapshot, duplicates)
+                if len(dup.data.vertices) != expected
+            ]
+            if disagree:
+                for dup in [basis, *duplicates]:
+                    bpy.data.objects.remove(dup, do_unlink=True)
                 _activate(context, obj)
-                bpy.ops.object.duplicate(linked=False)
-                dup = context.active_object
-                dup.name = f"__tk_shapekey_{name}"
-                for i, key in enumerate(dup.data.shape_keys.key_blocks):
-                    key.value = 1.0 if i == index else 0.0
-                    key.slider_min, key.slider_max = 0.0, 1.0
-                bpy.ops.object.shape_key_remove(all=True, apply_mix=True)
-                _apply_all_modifiers(dup)
-                duplicates.append(dup)
+                self.report(
+                    {'ERROR'},
+                    "Modifiers give these shapekeys a different vertex count to "
+                    f"the Basis: {', '.join(disagree)}. Apply or remove the "
+                    "modifiers that rebuild geometry from its shape.",
+                )
+                return {'CANCELLED'}
+            bpy.data.objects.remove(basis, do_unlink=True)
 
             _activate(context, obj)
             bpy.ops.object.shape_key_remove(all=True)
