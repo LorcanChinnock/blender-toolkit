@@ -119,6 +119,9 @@ class TK_OT_retopo_setup(bpy.types.Operator):
 
         self._arm(context, source, retopo)
 
+        if not retopo.data.vertices:
+            notes.append("Ctrl+RMB to place the first vertex")
+
         verb = "ready" if created else "adopted"
         suffix = f" ({', '.join(notes)})" if notes else ""
         self.report({'INFO'}, f"Retopo mesh '{retopo.name}' {verb}{suffix}")
